@@ -1,0 +1,13 @@
+{
+  "name": "sammy-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live Sammy AI sales dashboard — pulls HubSpot data in real-time",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "express": "^5.1.0"
+  }
+}
