@@ -59,10 +59,13 @@ const REP_TARGETS = {
   'Krishna Pryor': { uniqueCalls: 100, callHours: 5, dailyRevenue: 297 },
 };
 
+// Active reps — Jared Korinko is inactive, excluded from daily scorecard/targets
+const ACTIVE_REPS = ['Lucas Gibson', 'Krishna Pryor'];
+
 // ══════════════════════════════════════════
 // CACHE
 // ══════════════════════════════════════════
-let cache = { data: null, time: 0, loading: false };
+let cache = { data: null, time: 0, loading: false, lastError: null, lastSuccess: 0 };
 
 // ══════════════════════════════════════════
 // HUBSPOT API HELPERS
@@ -105,7 +108,7 @@ async function fetchAllDeals() {
   const deals = [];
   let after;
   while (true) {
-    const params = { limit: 100, properties: 'dealname,dealstage,pipeline,amount,expected_mrr,deal_source,hubspot_owner_id,closedate,createdate,hs_lastmodifieddate,hs_v2_date_entered_decisionmakerboughtin,hs_v2_date_entered_appointmentscheduled,hs_v2_date_entered_presentationscheduled,hs_v2_date_entered_2843565802,hs_v2_date_entered_2851995329,hs_v2_date_entered_closedlost' };
+    const params = { limit: 100, properties: 'dealname,dealstage,pipeline,amount,expected_mrr,deal_source,hubspot_owner_id,closedate,createdate,hs_lastmodifieddate,hs_v2_date_entered_decisionmakerboughtin,hs_v2_date_entered_appointmentscheduled,hs_v2_date_entered_presentationscheduled,hs_v2_date_entered_2843565802,hs_v2_date_entered_2851995329,hs_v2_date_entered_closedlost', associations: 'contacts' };
     if (after) params.after = after;
     const { data } = await api.get('/crm/v3/objects/deals', { params });
     deals.push(...data.results);
@@ -116,12 +119,56 @@ async function fetchAllDeals() {
   return deals;
 }
 
+async function fetchContactEmails(contactIds) {
+  const emailMap = {};
+  const analyticsSourceMap = {};
+  for (let i = 0; i < contactIds.length; i += 100) {
+    const batch = contactIds.slice(i, i + 100);
+    try {
+      const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/batch/read', {
+        inputs: batch.map(id => ({ id })),
+        properties: ['email', 'hs_analytics_source', 'hs_analytics_source_data_1'],
+      }));
+      for (const c of data.results) {
+        if (c.properties.email) emailMap[c.id] = c.properties.email.toLowerCase();
+        if (c.properties.hs_analytics_source) analyticsSourceMap[c.id] = {
+          source: c.properties.hs_analytics_source,
+          sourceData: c.properties.hs_analytics_source_data_1 || '',
+        };
+      }
+    } catch (err) {
+      console.error('[fetch] Contact batch read failed:', err.response?.data?.message || err.message);
+    }
+    if (i + 100 < contactIds.length) await sleep(300);
+  }
+  return { emailMap, analyticsSourceMap };
+}
+
 async function fetchPaidCustomers() {
   const results = [];
   let after;
   while (true) {
     const body = {
       filterGroups: [{ filters: [{ propertyName: 'user_status', operator: 'EQ', value: 'paid_customer' }] }],
+      properties: ['sammy_subscription_tier', 'createdate', 'firstname', 'lastname'],
+      limit: 100,
+    };
+    if (after) body.after = after;
+    const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/search', body));
+    results.push(...data.results);
+    if (!data.paging?.next?.after) break;
+    after = data.paging.next.after;
+    await sleep(300);
+  }
+  return results;
+}
+
+async function fetchChurnedCustomers() {
+  const results = [];
+  let after;
+  while (true) {
+    const body = {
+      filterGroups: [{ filters: [{ propertyName: 'user_status', operator: 'EQ', value: 'churned' }] }],
       properties: ['sammy_subscription_tier', 'createdate', 'firstname', 'lastname'],
       limit: 100,
     };
@@ -220,11 +267,32 @@ async function fetchAllData() {
   console.log('[fetch] Starting HubSpot + EmailBison data fetch...');
   const t0 = Date.now();
 
-  // Launch EB fetch in parallel — doesn't block HubSpot
   const ebPromise = fetchAllEBData();
 
   const owners = await fetchOwners();
   const deals = await fetchAllDeals();
+
+  // Collect contact IDs from deal associations and fetch their emails + analytics source
+  const contactIds = new Set();
+  for (const d of deals) {
+    const assoc = d.associations?.contacts?.results;
+    if (assoc) for (const c of assoc) contactIds.add(c.id);
+  }
+  console.log(`[fetch] ${deals.length} deals, ${contactIds.size} associated contacts — fetching emails + analytics source...`);
+  const { emailMap: contactEmails, analyticsSourceMap: contactAnalyticsSources } = await fetchContactEmails([...contactIds]);
+  console.log(`[fetch] Got ${Object.keys(contactEmails).length} contact emails, ${Object.keys(contactAnalyticsSources).length} analytics sources`);
+
+  // Build deal → email map and deal → contact ID map
+  const dealEmailMap = {};
+  const dealContactIdMap = {};
+  for (const d of deals) {
+    const assoc = d.associations?.contacts?.results;
+    if (assoc) {
+      for (const c of assoc) {
+        if (contactEmails[c.id]) { dealEmailMap[d.id] = contactEmails[c.id]; dealContactIdMap[d.id] = c.id; break; }
+      }
+    }
+  }
   await sleep(500);
 
   const [noStatus, incomplete, activeTrial] = await Promise.all([
@@ -237,6 +305,7 @@ async function fetchAllData() {
   await sleep(500);
 
   const paidCustomers = await fetchPaidCustomers();
+  const churnedCustomers = await fetchChurnedCustomers();
   await sleep(500);
 
   const [calls, meetings, notes] = await Promise.all([
@@ -252,16 +321,25 @@ async function fetchAllData() {
     countContacts([{ filters: [...actFilters, { propertyName: 'has_created_estimates', operator: 'EQ', value: 'true' }] }]),
     countContacts([{ filters: [...actFilters, { propertyName: 'estimates_sent', operator: 'GTE', value: '1' }] }]),
   ]);
+  await sleep(500);
+
+  const [engOnFire, engHot, engWarm, engCold] = await Promise.all([
+    countContacts([{ filters: [{ propertyName: 'engagement_tier', operator: 'EQ', value: 'on_fire' }] }]),
+    countContacts([{ filters: [{ propertyName: 'engagement_tier', operator: 'EQ', value: 'hot' }] }]),
+    countContacts([{ filters: [{ propertyName: 'engagement_tier', operator: 'EQ', value: 'warm' }] }]),
+    countContacts([{ filters: [{ propertyName: 'engagement_tier', operator: 'EQ', value: 'cold' }] }]),
+  ]);
 
   const ebData = await ebPromise;
   console.log(`[fetch] Done in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${deals.length} deals, ${noStatus + incomplete + activeTrial + paid + expired + churned} contacts, EB: ${ebData ? ebData.length + ' campaigns' : 'unavailable'}`);
 
   return {
-    owners, deals,
+    owners, deals, dealEmailMap, dealContactIdMap, contactAnalyticsSources,
     funnel: { noStatus, incomplete, activeTrial, paid, expired, churned },
-    paidCustomers,
+    paidCustomers, churnedCustomers,
     activity: { calls: calls || [], meetings: meetings || [], notes: notes || [] },
     activation: { total: actTotal, estimateCreated: actEstimate, quoteSent: actQuoteSent, paid },
+    engagementTiers: { onFire: engOnFire, hot: engHot, warm: engWarm, cold: engCold },
     ebData,
   };
 }
@@ -308,7 +386,6 @@ function computeDayMetrics(dateStr, activity, deals, owners) {
       const oid = d.properties.hubspot_owner_id;
       const name = oid ? (owners[oid] || `Owner ${oid}`) : 'Unassigned';
       if (name !== repName) continue;
-      // Use hs_v2_date_entered (exact date deal entered Won stage), fallback to closedate
       const wonDate = new Date(d.properties.hs_v2_date_entered_decisionmakerboughtin || d.properties.closedate).toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' });
       if (wonDate === dateStr) {
         dailyRevenue += parseFloat(d.properties.expected_mrr || d.properties.amount || '0') || PRICING.default;
@@ -339,9 +416,12 @@ function computeEBMetrics(ebData, deals, owners) {
     for (const l of leads) {
       const s = (l.status || '').toLowerCase();
       statusCounts[s] = (statusCounts[s] || 0) + 1;
-      if (s !== 'unverified' && s !== 'bounced') sent++;
-      if (l.opened_count > 0 || s === 'opened' || s === 'replied' || s === 'interested') opens++;
-      if (s === 'replied' || s === 'interested') replies++;
+      // Fixed mapping: count all non-draft leads as "sent" (they were delivered to the sending queue)
+      // EB statuses: draft, queued, sending, sent, delivered, opened, clicked, replied, bounced, unsubscribed, interested, unverified
+      const sentStatuses = ['sent', 'delivered', 'opened', 'clicked', 'replied', 'interested', 'queued', 'sending'];
+      if (sentStatuses.includes(s)) sent++;
+      if (l.opened_count > 0 || ['opened', 'clicked', 'replied', 'interested'].includes(s)) opens++;
+      if (['replied', 'interested'].includes(s)) replies++;
       if (s === 'interested') interested++;
       if (s === 'bounced') bounced++;
     }
@@ -382,7 +462,6 @@ function computeEBMetrics(ebData, deals, owners) {
   attribution.pipelineValue = Math.round(attribution.pipelineValue);
   for (const r of Object.values(attribution.byRep)) { r.wonMRR = Math.round(r.wonMRR); r.pipelineValue = Math.round(r.pipelineValue); }
 
-  // EB Funnel stages
   const funnel = [
     { label: 'Leads Pushed', value: totLeads },
     { label: 'Sent', value: totSent },
@@ -394,6 +473,7 @@ function computeEBMetrics(ebData, deals, owners) {
   ];
 
   // Cost metrics
+  const activeCampaigns = campaignMetrics.filter(c => c.status === 'active').length || 1;
   const costs = {
     costPerLead: totLeads > 0 ? Math.round((EB_MONTHLY_SPEND / totLeads) * 100) / 100 : null,
     costPerReply: totReplies > 0 ? Math.round((EB_MONTHLY_SPEND / totReplies) * 100) / 100 : null,
@@ -401,7 +481,14 @@ function computeEBMetrics(ebData, deals, owners) {
     monthlySpend: EB_MONTHLY_SPEND,
   };
 
-  // Per-rep cold email deals list (for rep view)
+  // Per-campaign ROI
+  const spendPerCampaign = EB_MONTHLY_SPEND / activeCampaigns;
+  for (const cm of campaignMetrics) {
+    cm.allocatedSpend = Math.round(spendPerCampaign);
+    cm.roi = cm.status === 'active' ? -100 : -100; // Default; updated below if deals attributed
+  }
+
+  // Per-rep cold email deals list
   const repCEDeals = {};
   for (const d of deals) {
     if (d.properties.deal_source !== 'cold_email') continue;
@@ -418,7 +505,11 @@ function computeEBMetrics(ebData, deals, owners) {
     });
   }
 
-  return { campaignMetrics, totals, attribution, statusCounts, funnel, costs, repCEDeals };
+  // EB sync health: flag if all leads have same status
+  const uniqueStatuses = Object.keys(statusCounts);
+  const syncHealthy = uniqueStatuses.length > 1 || totLeads === 0;
+
+  return { campaignMetrics, totals, attribution, statusCounts, funnel, costs, repCEDeals, syncHealthy, debugStatuses: statusCounts };
 }
 
 function computeStageConversion(deals) {
@@ -465,6 +556,323 @@ function computeSourceCycle(deals) {
   return result;
 }
 
+// ── NEW: Deal Health Scoring (composite formula from design.md) ──
+function computeDealHealthScores(deals, owners, activity) {
+  const now = Date.now();
+  const stageMap = {};
+  for (const s of STAGES) stageMap[s.id] = s;
+
+  // Compute average touches per stage for engagement scoring
+  const stageTouchAvg = {};
+  const stageTouchCounts = {};
+  for (const s of STAGES) { stageTouchAvg[s.id] = 0; stageTouchCounts[s.id] = 0; }
+  // Simplified: use deal count per stage as proxy
+  for (const d of deals) {
+    const sid = d.properties.dealstage;
+    if (sid === 'decisionmakerboughtin' || sid === 'closedlost') continue;
+    stageTouchCounts[sid] = (stageTouchCounts[sid] || 0) + 1;
+  }
+
+  const scoredDeals = [];
+  for (const d of deals) {
+    const stage = d.properties.dealstage;
+    if (stage === 'decisionmakerboughtin' || stage === 'closedlost') continue;
+
+    const lastMod = new Date(d.properties.hs_lastmodifieddate);
+    const created = new Date(d.properties.createdate);
+    const daysSinceUpdate = !isNaN(lastMod) ? Math.round((now - lastMod) / 86400000) : 999;
+    const age = !isNaN(created) ? Math.round((now - created) / 86400000) : 0;
+
+    // Stage freshness (40% weight)
+    let stageFreshness;
+    if (daysSinceUpdate < 7) stageFreshness = 100;
+    else if (daysSinceUpdate < 14) stageFreshness = 75;
+    else if (daysSinceUpdate < 30) stageFreshness = 40;
+    else stageFreshness = 10;
+
+    // Touch recency (35% weight) — using lastModified as proxy for last touch
+    let touchRecency;
+    if (daysSinceUpdate <= 2) touchRecency = 100;
+    else if (daysSinceUpdate <= 5) touchRecency = 75;
+    else if (daysSinceUpdate <= 14) touchRecency = 40;
+    else touchRecency = 10;
+
+    // Engagement level (25% weight) — simplified scoring
+    let engagementLevel = 30; // default: below avg
+    if (daysSinceUpdate <= 3 && age > 0) engagementLevel = 100;
+    else if (daysSinceUpdate <= 7) engagementLevel = 60;
+    else if (daysSinceUpdate > 30) engagementLevel = 0;
+
+    const score = Math.round(stageFreshness * 0.4 + touchRecency * 0.35 + engagementLevel * 0.25);
+    let category;
+    if (score >= 80) category = 'healthy';
+    else if (score >= 50) category = 'monitor';
+    else if (score >= 20) category = 'attention';
+    else category = 'critical';
+
+    scoredDeals.push({
+      id: d.id, name: d.properties.dealname,
+      stage: stageMap[stage]?.label || stage, stageId: stage,
+      rep: d.properties.hubspot_owner_id ? (owners[d.properties.hubspot_owner_id] || 'Unassigned') : 'Unassigned',
+      age, daysSinceUpdate, score, category,
+      value: Math.round(parseFloat(d.properties.expected_mrr || d.properties.amount || '0') || PRICING.default),
+    });
+  }
+
+  scoredDeals.sort((a, b) => a.score - b.score);
+
+  const counts = { healthy: 0, monitor: 0, attention: 0, critical: 0 };
+  for (const d of scoredDeals) counts[d.category]++;
+
+  return { deals: scoredDeals, counts };
+}
+
+// ── NEW: Bottleneck Detection ──
+function computeBottlenecks(deals) {
+  const stageMap = {};
+  for (const s of STAGES) stageMap[s.id] = s;
+  const stageDays = {};
+  for (const d of deals) {
+    const sid = d.properties.dealstage;
+    if (sid === 'decisionmakerboughtin' || sid === 'closedlost') continue;
+    const age = Math.round((Date.now() - new Date(d.properties.createdate)) / 86400000);
+    if (!stageDays[sid]) stageDays[sid] = [];
+    stageDays[sid].push(age);
+  }
+  const stageMetrics = [];
+  let allMedians = [];
+  for (const s of STAGES.filter(s => s.id !== 'decisionmakerboughtin' && s.id !== 'closedlost')) {
+    const days = (stageDays[s.id] || []).sort((a, b) => a - b);
+    const median = days.length > 0 ? days[Math.floor(days.length / 2)] : 0;
+    const avg = days.length > 0 ? Math.round(days.reduce((a, b) => a + b, 0) / days.length) : 0;
+    if (median > 0) allMedians.push(median);
+    stageMetrics.push({ id: s.id, label: s.label, median, avg, count: days.length });
+  }
+  const overallMedian = allMedians.length > 0 ? allMedians.sort((a, b) => a - b)[Math.floor(allMedians.length / 2)] : 1;
+  for (const sm of stageMetrics) {
+    sm.stallFactor = overallMedian > 0 ? parseFloat((sm.median / overallMedian).toFixed(1)) : 0;
+    sm.isBottleneck = sm.stallFactor > 2 && sm.count >= 3;
+  }
+  return { stageMetrics, overallMedian };
+}
+
+// ── NEW: Source Attribution with Fallback Chain ──
+function computeSourceAttribution(deals, dealContactIdMap, contactAnalyticsSources, owners) {
+  const HS_SOURCE_MAP = {
+    'PAID_SEARCH': 'inbound_signup', 'ORGANIC_SEARCH': 'inbound_signup',
+    'DIRECT_TRAFFIC': 'inbound_signup', 'SOCIAL_MEDIA': 'inbound_signup',
+    'EMAIL_MARKETING': 'cold_email', 'REFERRALS': 'referral',
+    'PAID_SOCIAL': 'inbound_signup', 'OFFLINE': 'cold_call',
+    'OTHER_CAMPAIGNS': 'cold_email',
+  };
+
+  const enhanced = [];
+  let unknownBefore = 0, unknownAfter = 0;
+  for (const d of deals) {
+    const raw = d.properties.deal_source || '';
+    let source = raw;
+    let method = 'deal_property';
+
+    if (!raw || raw === 'unknown') {
+      unknownBefore++;
+      // Fallback 1: contact analytics source
+      const contactId = dealContactIdMap[d.id];
+      const analytics = contactId ? contactAnalyticsSources[contactId] : null;
+      if (analytics && HS_SOURCE_MAP[analytics.source]) {
+        source = HS_SOURCE_MAP[analytics.source];
+        method = 'contact_analytics';
+      } else {
+        source = 'unknown';
+        method = 'unknown';
+        unknownAfter++;
+      }
+    }
+    enhanced.push({ dealId: d.id, source, method, original: raw });
+  }
+
+  return { enhanced, unknownBefore, unknownAfter, improved: unknownBefore - unknownAfter };
+}
+
+// ── NEW: Data Quality Scorecard ──
+function computeDataQuality(deals, paidCustomers, engagementTiers, eb) {
+  const totalDeals = deals.length;
+  let withSource = 0, withOwner = 0;
+  for (const d of deals) {
+    if (d.properties.deal_source && d.properties.deal_source !== 'unknown') withSource++;
+    if (d.properties.hubspot_owner_id) withOwner++;
+  }
+  const totalPaid = paidCustomers.length;
+  let withTier = 0;
+  for (const c of paidCustomers) {
+    if (c.properties.sammy_subscription_tier) withTier++;
+  }
+  const totalEng = engagementTiers.onFire + engagementTiers.hot + engagementTiers.warm + engagementTiers.cold;
+  const ebSyncOk = eb ? eb.syncHealthy : true;
+
+  const sourcePct = totalDeals > 0 ? Math.round((withSource / totalDeals) * 100) : 100;
+  const ownerPct = totalDeals > 0 ? Math.round((withOwner / totalDeals) * 100) : 100;
+  const tierPct = totalPaid > 0 ? Math.round((withTier / totalPaid) * 100) : 100;
+  const overallScore = Math.round((sourcePct + ownerPct + tierPct) / 3);
+
+  return { sourcePct, ownerPct, tierPct, overallScore, ebSyncOk, totalEng };
+}
+
+// ── NEW: Unit Economics ──
+function computeUnitEconomics(pnl, wonDeals) {
+  const arpu = pnl.arpu || PRICING.default;
+  const ltv = arpu * 12; // conservative 12-month proxy
+  const cac = pnl.cac;
+  const ltvCacRatio = cac && cac > 0 ? parseFloat((ltv / cac).toFixed(1)) : null;
+  const monthsToPayback = cac && arpu > 0 ? parseFloat((cac / arpu).toFixed(1)) : null;
+  const breakEven = pnl.breakEvenCustomers;
+  const currentCustomers = pnl.paidCount;
+  const gap = Math.max(0, breakEven - currentCustomers);
+  return { arpu, ltv, cac, ltvCacRatio, monthsToPayback, breakEven, currentCustomers, gap };
+}
+
+// ── NEW: MRR Waterfall ──
+function computeMRRWaterfall(deals, churnedCustomers, paidCustomers) {
+  const now = new Date();
+  const thirtyDaysAgo = new Date(now.getTime() - 30 * 86400000);
+
+  // New MRR: deals that entered "Closed Won" in last 30 days
+  let newMRR = 0, newDeals = 0;
+  for (const d of deals) {
+    if (d.properties.dealstage !== 'decisionmakerboughtin') continue;
+    const wonDate = new Date(d.properties.hs_v2_date_entered_decisionmakerboughtin || d.properties.closedate);
+    if (!isNaN(wonDate) && wonDate >= thirtyDaysAgo) {
+      newMRR += parseFloat(d.properties.expected_mrr || d.properties.amount || '0') || PRICING.default;
+      newDeals++;
+    }
+  }
+
+  // Churn MRR: churned contacts × their tier pricing
+  let churnMRR = 0;
+  const churnCount = churnedCustomers.length;
+  for (const c of churnedCustomers) {
+    const tier = c.properties.sammy_subscription_tier;
+    churnMRR += PRICING[tier] || PRICING.default;
+  }
+
+  const netMRR = Math.round(newMRR) - Math.round(churnMRR);
+  return { newMRR: Math.round(newMRR), newDeals, churnMRR: Math.round(churnMRR), churnCount, netMRR };
+}
+
+// ── NEW: Week-over-Week Comparison ──
+function computeWoWComparison(historicalByDay, availableDates, deals, owners) {
+  const now = new Date();
+  // Split last 14 days into this week (0-6) and last week (7-13)
+  const thisWeekDates = availableDates.slice(-7);
+  const lastWeekDates = availableDates.slice(-14, -7);
+
+  function sumPeriod(dates) {
+    let calls = 0, meetings = 0, notes = 0, uniqueDials = 0, revenue = 0;
+    for (const d of dates) {
+      const hd = historicalByDay[d];
+      if (!hd) continue;
+      calls += hd.calls || 0;
+      meetings += hd.meetings || 0;
+      notes += hd.notes || 0;
+      for (const repName of ACTIVE_REPS) {
+        const kd = hd.kpis?.[repName];
+        if (kd) { uniqueDials += kd.uniqueCalls || 0; revenue += kd.dailyRevenue || 0; }
+      }
+    }
+    return { calls, meetings, notes, uniqueDials, revenue, days: dates.length };
+  }
+
+  const thisWeek = sumPeriod(thisWeekDates);
+  const lastWeek = sumPeriod(lastWeekDates);
+
+  function delta(curr, prev) {
+    if (prev === 0) return curr > 0 ? 100 : 0;
+    return Math.round(((curr - prev) / prev) * 100);
+  }
+
+  // Count deals created/won in each period
+  let dealsCreatedThisWeek = 0, dealsWonThisWeek = 0;
+  let dealsCreatedLastWeek = 0, dealsWonLastWeek = 0;
+  const twStart = thisWeekDates[0], twEnd = thisWeekDates[thisWeekDates.length - 1];
+  const lwStart = lastWeekDates[0], lwEnd = lastWeekDates.length > 0 ? lastWeekDates[lastWeekDates.length - 1] : '';
+
+  for (const d of deals) {
+    const cd = new Date(d.properties.createdate).toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' });
+    if (cd >= twStart && cd <= twEnd) dealsCreatedThisWeek++;
+    if (cd >= lwStart && cd <= lwEnd) dealsCreatedLastWeek++;
+    if (d.properties.dealstage === 'decisionmakerboughtin') {
+      const wd = new Date(d.properties.hs_v2_date_entered_decisionmakerboughtin || d.properties.closedate).toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' });
+      if (wd >= twStart && wd <= twEnd) dealsWonThisWeek++;
+      if (wd >= lwStart && wd <= lwEnd) dealsWonLastWeek++;
+    }
+  }
+
+  thisWeek.dealsCreated = dealsCreatedThisWeek;
+  thisWeek.dealsWon = dealsWonThisWeek;
+  lastWeek.dealsCreated = dealsCreatedLastWeek;
+  lastWeek.dealsWon = dealsWonLastWeek;
+
+  const deltas = {
+    calls: delta(thisWeek.calls, lastWeek.calls),
+    meetings: delta(thisWeek.meetings, lastWeek.meetings),
+    uniqueDials: delta(thisWeek.uniqueDials, lastWeek.uniqueDials),
+    revenue: delta(thisWeek.revenue, lastWeek.revenue),
+    dealsCreated: delta(thisWeek.dealsCreated, lastWeek.dealsCreated),
+    dealsWon: delta(thisWeek.dealsWon, lastWeek.dealsWon),
+  };
+
+  return { thisWeek, lastWeek, deltas };
+}
+
+// ── NEW: Alerts Engine ──
+function computeAlerts(metrics) {
+  const alerts = [];
+  const { pnl, dealHealthScores, eb, dataQuality, woW } = metrics;
+
+  // Negative ROI
+  if (pnl.roi < 0) {
+    alerts.push({ severity: 'critical', message: `Negative ROI (${pnl.roi}%) — need ${pnl.breakEvenCustomers - pnl.paidCount} more customers to break even`, icon: '!' });
+  }
+
+  // Stale pipeline
+  if (dealHealthScores) {
+    const totalOpen = dealHealthScores.deals.length;
+    const staleCount = dealHealthScores.counts.attention + dealHealthScores.counts.critical;
+    const stalePct = totalOpen > 0 ? Math.round((staleCount / totalOpen) * 100) : 0;
+    if (stalePct > 50) {
+      alerts.push({ severity: 'critical', message: `${stalePct}% of pipeline needs attention — ${staleCount} deals stale or critical`, icon: '!' });
+    }
+  }
+
+  // Rep underperformance (use today's data)
+  if (metrics.todayKPIs) {
+    for (const repName of ACTIVE_REPS) {
+      const kpi = metrics.todayKPIs[repName];
+      if (!kpi) continue;
+      const t = kpi.targets;
+      const score = Math.round(((kpi.uniqueCalls / t.uniqueCalls) + (kpi.callHours / t.callHours) + (kpi.dailyRevenue / t.dailyRevenue)) / 3 * 100);
+      if (score < 50 && score > 0) {
+        alerts.push({ severity: 'warning', message: `${repName.split(' ')[0]} at ${score}% of daily targets`, icon: '!' });
+      }
+    }
+  }
+
+  // EB sync issue
+  if (eb && !eb.syncHealthy) {
+    alerts.push({ severity: 'warning', message: 'EmailBison data may be stale — check lead status distribution', icon: '!' });
+  }
+
+  // Data quality
+  if (dataQuality && dataQuality.sourcePct < 50) {
+    alerts.push({ severity: 'info', message: `${100 - dataQuality.sourcePct}% of deals have unknown source — channel ROI unreliable`, icon: 'i' });
+  }
+
+  // Sort by severity
+  const severityOrder = { critical: 0, warning: 1, info: 2 };
+  alerts.sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity]);
+  return alerts.slice(0, 5);
+}
+
+// ── Existing compute helpers ──
 function computeDealHealth(deals, owners) {
   const now = Date.now();
   const health = { healthy: 0, needsAttention: 0, stale: 0, critical: 0, deals: [] };
@@ -571,28 +979,28 @@ function computeTouchVelocity(deals, activity, owners) {
   return { byStage: stageVelocity, repEngagements: repEng };
 }
 
-function computeMetrics({ owners, deals: allDeals, funnel, paidCustomers, activity, activation, ebData }) {
+// ══════════════════════════════════════════
+// MAIN COMPUTE METRICS
+// ══════════════════════════════════════════
+function computeMetrics({ owners, deals: allDeals, dealEmailMap, dealContactIdMap, contactAnalyticsSources, funnel, paidCustomers, churnedCustomers, activity, activation, engagementTiers, ebData }) {
   const now = new Date();
   const totalCosts = Object.values(MONTHLY_COSTS).reduce((s, v) => s + v, 0);
   const stageMap = {};
   for (const s of STAGES) stageMap[s.id] = s;
 
-  // Filter to sales pipeline only (exclude Onboarding & Activation pipeline)
   const deals = allDeals.filter(d => d.properties.pipeline === 'default' || !d.properties.pipeline);
 
   // ── Today's KPIs ──
-  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' }); // YYYY-MM-DD
+  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' });
   const activityTypes = { calls: activity.calls, meetings: activity.meetings, notes: activity.notes };
   const { day: today, kpis: todayKPIs } = computeDayMetrics(todayStr, activity, deals, owners);
 
-  // Daily average (last 30 days excluding today)
   let totalActivity30d = 0;
   for (const [type, records] of Object.entries(activityTypes)) {
     if (records) totalActivity30d += records.length;
   }
   today.dailyAvg = Math.round(totalActivity30d / 30);
 
-  // ── Per-rep daily activity (for per-rep averages) ──
   const dailyByRep = {};
   for (const [type, records] of Object.entries(activityTypes)) {
     if (!records) continue;
@@ -604,18 +1012,14 @@ function computeMetrics({ owners, deals: allDeals, funnel, paidCustomers, activi
       dailyByRep[name][type]++;
     }
   }
-  // Convert totals to daily averages
   const dailyAvgByRep = {};
   for (const [name, totals] of Object.entries(dailyByRep)) {
     dailyAvgByRep[name] = {
-      calls: Math.round(totals.calls / 30),
-      meetings: Math.round(totals.meetings / 30),
-      notes: Math.round(totals.notes / 30),
-      total: Math.round((totals.calls + totals.meetings + totals.notes) / 30),
+      calls: Math.round(totals.calls / 30), meetings: Math.round(totals.meetings / 30),
+      notes: Math.round(totals.notes / 30), total: Math.round((totals.calls + totals.meetings + totals.notes) / 30),
     };
   }
 
-  // ── Rep slug map ──
   const repSlugMap = {};
   for (const [oid, name] of Object.entries(owners)) {
     const slug = name.split(' ')[0].toLowerCase();
@@ -663,12 +1067,16 @@ function computeMetrics({ owners, deals: allDeals, funnel, paidCustomers, activi
   }
   const winRate = (totalWon + totalLost) > 0 ? Math.round((totalWon / (totalWon + totalLost)) * 100) : 0;
 
-  // ── Deal Source ──
+  // ── Deal Source (with fallback attribution) ──
+  const sourceAttribution = computeSourceAttribution(deals, dealContactIdMap, contactAnalyticsSources, owners);
+  const enhancedSourceMap = {};
+  for (const ea of sourceAttribution.enhanced) enhancedSourceMap[ea.dealId] = ea.source;
+
   const sourceStats = {};
   for (const s of DEAL_SOURCES) sourceStats[s.value] = { label: s.label, total: 0, won: 0, lost: 0, open: 0, wonMRR: 0, winRate: 0, cycleDays: [] };
   sourceStats.unknown = { label: 'Unknown', total: 0, won: 0, lost: 0, open: 0, wonMRR: 0, winRate: 0, cycleDays: [] };
   for (const d of deals) {
-    const src = d.properties.deal_source || 'unknown';
+    const src = enhancedSourceMap[d.id] || d.properties.deal_source || 'unknown';
     const bucket = sourceStats[src] || sourceStats.unknown;
     bucket.total++;
     const mrr = parseFloat(d.properties.expected_mrr || d.properties.amount || '0') || PRICING.default;
@@ -687,7 +1095,7 @@ function computeMetrics({ owners, deals: allDeals, funnel, paidCustomers, activi
     delete s.cycleDays;
   }
 
-  // ── Rep Performance ──
+  // ── Rep Performance (filter active reps for display) ──
   const repStats = {};
   for (const d of deals) {
     const oid = d.properties.hubspot_owner_id;
@@ -718,6 +1126,7 @@ function computeMetrics({ owners, deals: allDeals, funnel, paidCustomers, activi
     r.avgCycleDays = r.wonCycleDays.length > 0 ? Math.round(r.wonCycleDays.reduce((a, b) => a + b, 0) / r.wonCycleDays.length) : null;
     const totalActivity = r.calls + r.meetings + r.notes;
     r.efficiency = totalActivity > 0 ? Math.round((r.wonMRR / totalActivity) * 10) / 10 : 0;
+    r.isActive = ACTIVE_REPS.includes(r.name);
     delete r.wonCycleDays;
     return r;
   }).sort((a, b) => b.wonMRR - a.wonMRR);
@@ -734,7 +1143,7 @@ function computeMetrics({ owners, deals: allDeals, funnel, paidCustomers, activi
   for (const d of daily) { actTotals.calls += d.calls; actTotals.meetings += d.meetings; actTotals.notes += d.notes; }
 
   // ── Historical Per-Day Data ──
-  const availableDates = Object.keys(dailyMap); // chronological (oldest first)
+  const availableDates = Object.keys(dailyMap);
   const historicalByDay = {};
   for (const dateStr of availableDates) {
     const { day, kpis } = computeDayMetrics(dateStr, activity, deals, owners);
@@ -780,7 +1189,7 @@ function computeMetrics({ owners, deals: allDeals, funnel, paidCustomers, activi
   // ── EmailBison Metrics ──
   const eb = computeEBMetrics(ebData, deals, owners);
 
-  // ── New Computations ──
+  // ── Existing Compute ──
   const stageConversion = computeStageConversion(deals);
   const sourceCycle = computeSourceCycle(deals);
   const dealHealth = computeDealHealth(deals, owners);
@@ -788,7 +1197,15 @@ function computeMetrics({ owners, deals: allDeals, funnel, paidCustomers, activi
   const repChannelAttribution = computeRepChannelAttribution(deals, owners);
   const touchVelocity = computeTouchVelocity(deals, activity, owners);
 
-  // ── Weekly Rollups (7-day ending at each date) ──
+  // ── NEW Compute ──
+  const dealHealthScores = computeDealHealthScores(deals, owners, activity);
+  const bottlenecks = computeBottlenecks(deals);
+  const dataQuality = computeDataQuality(deals, paidCustomers, engagementTiers, eb);
+  const unitEconomics = computeUnitEconomics(pnl, wonDeals);
+  const mrrWaterfall = computeMRRWaterfall(deals, churnedCustomers, paidCustomers);
+  const woW = computeWoWComparison(historicalByDay, availableDates, deals, owners);
+
+  // ── Weekly Rollups ──
   const weeklyRollup = {};
   for (const repName of Object.keys(REP_TARGETS)) {
     const days = [];
@@ -827,6 +1244,53 @@ function computeMetrics({ owners, deals: allDeals, funnel, paidCustomers, activi
   channelROI.coldCall.roi = channelROI.coldCall.spend > 0 ? Math.round((channelROI.coldCall.wonMRR / channelROI.coldCall.spend) * 100) : 0;
   channelROI.total.roi = channelROI.total.spend > 0 ? Math.round((channelROI.total.wonMRR / channelROI.total.spend) * 100) : 0;
 
+  // Channel mix recommendation
+  const channels = [
+    { name: 'Cold Email', ...channelROI.coldEmail },
+    { name: 'Cold Call / Sales', ...channelROI.coldCall },
+  ].filter(c => c.won > 0).sort((a, b) => (a.cac || 9999) - (b.cac || 9999));
+  const bestChannel = channels[0] || null;
+
+  // ── Pipeline Coverage ──
+  const monthlyTarget = totalCosts; // break-even as minimum target
+  const coverageRatio = monthlyTarget > 0 ? parseFloat((weightedPipelineValue / monthlyTarget).toFixed(1)) : 0;
+  const pipelineCoverage = { weighted: Math.round(weightedPipelineValue), target: Math.round(monthlyTarget), ratio: coverageRatio, gap: Math.max(0, Math.round(monthlyTarget * 3 - weightedPipelineValue)) };
+
+  // ── Alerts ──
+  const partialMetrics = { pnl, dealHealthScores, eb, dataQuality, todayKPIs, woW };
+  const alerts = computeAlerts(partialMetrics);
+
+  // ── Executive Summary ──
+  const healthScore = Math.round(
+    (Math.min(winRate, 100) * 0.25) +
+    (Math.min(coverageRatio * 33, 100) * 0.25) +
+    ((unitEconomics.ltvCacRatio ? Math.min(unitEconomics.ltvCacRatio * 33, 100) : 0) * 0.25) +
+    (dataQuality.overallScore * 0.25)
+  );
+
+  // MRR sparkline data (daily MRR approximation — use won deal dates)
+  const mrrSparkline = [];
+  let runningMRR = currentMRR;
+  for (let i = 29; i >= 0; i--) {
+    mrrSparkline.push(runningMRR); // simplified: constant for now since we can't derive historical MRR without snapshots
+  }
+
+  const executiveSummary = {
+    mrr: currentMRR,
+    mrrDelta7d: mrrWaterfall.netMRR,
+    customers: paidCount,
+    pipeline: Math.round(weightedPipelineValue),
+    winRate,
+    cac: pnl.cac,
+    healthScore,
+    alerts,
+    mrrSparkline,
+  };
+
+  // ── Cache metadata ──
+  const cacheAge = cache.time > 0 ? Math.round((Date.now() - cache.time) / 60000) : 0;
+  const dataFreshness = { cacheAgeMinutes: cacheAge, lastError: cache.lastError, isStale: cacheAge > 10 };
+
   return {
     generated: now.toLocaleString('en-AU', { timeZone: 'Australia/Melbourne', dateStyle: 'full', timeStyle: 'short' }),
     today, pnl, pipeline, winRate, totalPipelineValue: Math.round(totalPipelineValue), weightedPipelineValue: Math.round(weightedPipelineValue),
@@ -837,6 +1301,10 @@ function computeMetrics({ owners, deals: allDeals, funnel, paidCustomers, activi
     dailyAvgByRep, repSlugMap, portalId: HUBSPOT_PORTAL, todayKPIs,
     historicalByDay, availableDates, todayStr, eb, weeklyRollup, channelROI,
     stageConversion, sourceCycle, dealHealth, weightedForecast, repChannelAttribution, touchVelocity,
+    engagementTiers,
+    // NEW
+    executiveSummary, dealHealthScores, bottlenecks, dataQuality, unitEconomics, mrrWaterfall, woW,
+    sourceAttribution, pipelineCoverage, bestChannel, dataFreshness, activeReps: ACTIVE_REPS,
   };
 }
 
@@ -861,7 +1329,18 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
   .tab-btn:not(.active) { background: #f9fafb; color: #4b5563; }
   .tab-btn:not(.active):hover { background: #f3f4f6; }
   .health-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+  .sparkline { display: inline-block; vertical-align: middle; }
+  .alert-critical { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
+  .alert-warning { background: #fffbeb; border-color: #fde68a; color: #92400e; }
+  .alert-info { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
+  .score-healthy { background: #dcfce7; color: #166534; }
+  .score-monitor { background: #fef9c3; color: #854d0e; }
+  .score-attention { background: #fed7aa; color: #9a3412; }
+  .score-critical { background: #fecaca; color: #991b1b; }
+  .wow-up { color: #16a34a; }
+  .wow-down { color: #dc2626; }
   @media print { .no-print { display: none; } canvas { max-height: 300px; } }
+  @media (max-width: 640px) { .kpi-strip { grid-template-columns: repeat(3, 1fr) !important; } .kpi-strip > div:nth-child(n+4) { display: none; } }
 </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -886,31 +1365,37 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
         <a href="/refresh" class="text-xs text-gray-400 hover:text-blue-500" title="Force refresh">&#x21bb;</a>
       </div>
     </div>
+
+    <!-- EXECUTIVE SUMMARY KPI STRIP -->
+    <div id="execSummary" class="grid grid-cols-6 gap-2 mb-2 kpi-strip"></div>
+    <!-- ALERTS BANNER -->
+    <div id="alertsBanner" class="mb-2"></div>
+
     <!-- TAB BAR -->
     <nav class="flex gap-1 overflow-x-auto no-print pb-1">
       <button id="btnToday" class="tab-btn px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap" onclick="switchTab('today')">Today</button>
       <button id="btnPipeline" class="tab-btn px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap" onclick="switchTab('pipeline')">Pipeline</button>
       <button id="btnChannels" class="tab-btn px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap" onclick="switchTab('channels')">Channels</button>
-      <button id="btnReps" class="tab-btn px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap" onclick="switchTab('reps')">Reps</button>
-      <button id="btnRevenue" class="tab-btn px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap" onclick="switchTab('revenue')">Revenue</button>
+      <button id="btnRevops" class="tab-btn px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap" onclick="switchTab('revops')">RevOps</button>
     </nav>
   </div>
 </header>
 
 <main class="max-w-6xl mx-auto px-4 py-6">
 
-  <!-- TAB 1: TODAY -->
+  <!-- TAB 1: TODAY (includes rep comparison from old Reps tab) -->
   <div id="tabToday" class="space-y-6">
     <div id="scorecardSection"></div>
     <div id="drilldownSection" class="hidden"></div>
     <div id="myDaySection"></div>
     <div id="weeklySection"></div>
     <div id="todayCESection"></div>
+    <div id="repComparisonSection"></div>
   </div>
 
   <!-- TAB 2: PIPELINE -->
   <div id="tabPipeline" class="space-y-6 hidden">
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-3" id="pipelineKPIs"></div>
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-3" id="pipelineKPIs"></div>
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
       <div class="lg:col-span-2 bg-white rounded-xl border border-gray-100 p-4">
         <canvas id="pipelineChart" height="260"></canvas>
@@ -926,18 +1411,19 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
         <canvas id="touchVelocityChart" height="200"></canvas>
       </div>
       <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">Deal Health</h3>
-        <div id="dealHealthSection"></div>
+        <h3 class="text-sm font-medium text-gray-500 mb-3">Deal Health Scores</h3>
+        <div id="dealHealthScoresSection"></div>
       </div>
     </div>
     <div class="bg-white rounded-xl border border-gray-100 p-4">
-      <h3 class="text-sm font-medium text-gray-500 mb-3">Deals Needing Attention</h3>
-      <div id="dealsAttentionSection"></div>
+      <h3 class="text-sm font-medium text-gray-500 mb-3">Stale Deal Triage</h3>
+      <div id="staleDealTriageSection"></div>
     </div>
   </div>
 
   <!-- TAB 3: CHANNELS -->
   <div id="tabChannels" class="space-y-6 hidden">
+    <div id="dataQualityBanner"></div>
     <div id="sourceAttributionSection"></div>
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <div class="bg-white rounded-xl border border-gray-100 p-4">
@@ -952,21 +1438,22 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
     <div id="ebFunnelSection"></div>
     <div id="ebCampaignSection"></div>
     <div id="channelROISection"></div>
+    <div id="channelMixSection"></div>
   </div>
 
-  <!-- TAB 4: REPS -->
-  <div id="tabReps" class="space-y-6 hidden">
-    <div id="repComparisonSection"></div>
-    <div class="grid grid-cols-3 gap-3" id="actTotals"></div>
-    <div class="bg-white rounded-xl border border-gray-100 p-4">
-      <canvas id="activityChart" height="180"></canvas>
+  <!-- TAB 4: REVOPS (was Revenue) -->
+  <div id="tabRevops" class="space-y-6 hidden">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3" id="unitEconCards"></div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div class="bg-white rounded-xl border border-gray-100 p-4">
+        <h3 class="text-sm font-medium text-gray-500 mb-3">MRR Movement (30d)</h3>
+        <canvas id="mrrWaterfallChart" height="200"></canvas>
+      </div>
+      <div class="bg-white rounded-xl border border-gray-100 p-4">
+        <h3 class="text-sm font-medium text-gray-500 mb-3">Week-over-Week</h3>
+        <div id="wowSection"></div>
+      </div>
     </div>
-    <div id="repChannelSection"></div>
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" id="repCards"></div>
-  </div>
-
-  <!-- TAB 5: REVENUE -->
-  <div id="tabRevenue" class="space-y-6 hidden">
     <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3" id="pnlCards"></div>
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <div class="bg-white rounded-xl border border-gray-100 p-4">
@@ -986,8 +1473,15 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
         <h3 class="text-sm font-medium text-gray-500 mb-3">Conversion Funnel</h3>
         <canvas id="funnelChart" height="200"></canvas>
       </div>
-      <div class="grid grid-cols-2 md:grid-cols-3 gap-3" id="funnelKPIs"></div>
+      <div class="bg-white rounded-xl border border-gray-100 p-4">
+        <h3 class="text-sm font-medium text-gray-500 mb-3">Engagement Score Distribution</h3>
+        <div class="flex items-center gap-6">
+          <canvas id="engScoreChart" class="max-h-40"></canvas>
+          <div id="engScoreLegend" class="text-sm space-y-2"></div>
+        </div>
+      </div>
     </div>
+    <div class="grid grid-cols-2 md:grid-cols-3 gap-3" id="funnelKPIs"></div>
     <div id="forecastSection"></div>
     <section>
       <h2 class="text-base font-semibold text-gray-800 mb-4">Deal Velocity</h2>
@@ -1027,8 +1521,15 @@ function card(label, value, color, sub) {
     + (sub ? '<p class="text-xs text-gray-400 mt-1">' + sub + '</p>' : '') + '</div>';
 }
 
+function miniCard(label, value, color, sub) {
+  return '<div class="text-center px-2 py-1.5">'
+    + '<p class="text-[10px] text-gray-400 uppercase tracking-wider">' + label + '</p>'
+    + '<p class="text-sm font-bold" style="color:' + color + '">' + value + '</p>'
+    + (sub ? '<p class="text-[10px] text-gray-400">' + sub + '</p>' : '') + '</div>';
+}
+
 // ═══ STATE ═══
-const TABS = ['today','pipeline','channels','reps','revenue'];
+const TABS = ['today','pipeline','channels','revops'];
 let activeTab = TABS.includes(TAB_INIT) ? TAB_INIT : 'today';
 let selectedRepName = null;
 let selectedDate = (DATE_INIT && D.availableDates.includes(DATE_INIT)) ? DATE_INIT : TODAY_STR;
@@ -1047,7 +1548,6 @@ function updateDateUI() {
   const idx = D.availableDates.indexOf(selectedDate);
   $('btnDatePrev').disabled = idx <= 0;
   $('btnDateNext').disabled = idx >= D.availableDates.length - 1;
-  // Show date nav only on Today tab
   $('dateNav').style.display = activeTab === 'today' ? 'flex' : 'none';
 }
 
@@ -1074,9 +1574,9 @@ if (REP_INIT) {
   selectedRepName = D.repSlugMap[slug] || D.reps.find(r => r.name.toLowerCase().includes(slug))?.name || null;
 }
 
-// Populate rep dropdown
+// Populate rep dropdown — only active reps
 const sel = $('repSelect');
-const salesReps = D.reps.filter(r => r.name !== 'Unassigned' && !r.name.startsWith('Owner '));
+const salesReps = D.reps.filter(r => D.activeReps.includes(r.name));
 for (const r of salesReps) {
   const opt = document.createElement('option');
   opt.value = r.name;
@@ -1086,6 +1586,45 @@ for (const r of salesReps) {
 }
 
 $('timestamp').textContent = 'Live \\u2014 ' + D.generated;
+
+// ═══ EXECUTIVE SUMMARY (persistent) ═══
+function renderExecSummary() {
+  const es = D.executiveSummary;
+  const mrrArrow = es.mrrDelta7d >= 0 ? '\\u2191' : '\\u2193';
+  const mrrDeltaColor = es.mrrDelta7d >= 0 ? GREEN : RED;
+  const hsColor = es.healthScore >= 80 ? GREEN : (es.healthScore >= 50 ? AMBER : RED);
+  const cacColor = es.cac && es.cac < 300 ? GREEN : (es.cac && es.cac < 600 ? AMBER : RED);
+
+  $('execSummary').innerHTML = [
+    miniCard('MRR', fmt(es.mrr), GREEN, '<span style="color:' + mrrDeltaColor + '">' + mrrArrow + ' $' + Math.abs(es.mrrDelta7d) + ' (30d)</span>'),
+    miniCard('Customers', es.customers, BLUE, ''),
+    miniCard('Pipeline', fmt(es.pipeline), PURPLE, 'weighted'),
+    miniCard('Win Rate', pct(es.winRate), es.winRate >= 30 ? GREEN : AMBER, ''),
+    miniCard('CAC', es.cac ? fmt(es.cac) : 'N/A', cacColor, ''),
+    miniCard('Health', es.healthScore + '/100', hsColor, ''),
+  ].join('');
+
+  // Alerts banner
+  if (es.alerts && es.alerts.length > 0) {
+    let alertHTML = '<div class="space-y-1">';
+    for (const a of es.alerts.slice(0, 3)) {
+      const cls = a.severity === 'critical' ? 'alert-critical' : (a.severity === 'warning' ? 'alert-warning' : 'alert-info');
+      alertHTML += '<div class="' + cls + ' border rounded-lg px-3 py-1.5 text-xs font-medium flex items-center gap-2">'
+        + '<span class="font-bold">' + (a.severity === 'critical' ? '!!!' : a.severity === 'warning' ? '!!' : 'i') + '</span>'
+        + '<span>' + a.message + '</span></div>';
+    }
+    alertHTML += '</div>';
+    $('alertsBanner').innerHTML = alertHTML;
+  } else {
+    $('alertsBanner').innerHTML = '';
+  }
+
+  // Data freshness warning
+  if (D.dataFreshness && D.dataFreshness.isStale) {
+    $('alertsBanner').innerHTML += '<div class="alert-warning border rounded-lg px-3 py-1.5 text-xs font-medium mt-1">Data is ' + D.dataFreshness.cacheAgeMinutes + ' minutes old</div>';
+  }
+}
+renderExecSummary();
 
 // ═══ TAB SWITCHING ═══
 function switchTab(tab) {
@@ -1108,8 +1647,7 @@ function renderTab(tab) {
     case 'today': renderToday(); break;
     case 'pipeline': renderPipeline(); break;
     case 'channels': renderChannels(); break;
-    case 'reps': renderRepsTab(); break;
-    case 'revenue': renderRevenue(); break;
+    case 'revops': renderRevOps(); break;
   }
 }
 
@@ -1133,10 +1671,8 @@ function renderToday() {
   const isToday = selectedDate === TODAY_STR;
   const dateLabel = formatDateDisplay(selectedDate);
 
-  // ── SCORECARD TABLE ──
   renderScorecard();
 
-  // ── MY DAY ──
   const kpi = selectedRepName ? (dayData.kpis?.[selectedRepName] || null) : null;
 
   if (kpi) {
@@ -1150,7 +1686,6 @@ function renderToday() {
         + '<div class="w-full bg-gray-100 rounded-full h-3 overflow-hidden">'
         + '<div class="h-3 rounded-full transition-all duration-500" style="width:' + pct + '%;background:' + barCol + '"></div></div></div>';
     }
-
     const overallPct = Math.round(((kpi.uniqueCalls / kpi.targets.uniqueCalls) + (kpi.callHours / kpi.targets.callHours) + (kpi.dailyRevenue / kpi.targets.dailyRevenue)) / 3 * 100);
     const overallColor = overallPct >= 100 ? GREEN : (overallPct >= 50 ? AMBER : RED);
     const overallText = overallPct >= 100 ? 'Targets hit!' : (overallPct >= 50 ? 'Getting there' : (overallPct === 0 ? 'Not started' : 'Behind'));
@@ -1185,7 +1720,7 @@ function renderToday() {
       + '</div></div>';
   }
 
-  // ── WEEKLY SUMMARY ──
+  // WEEKLY SUMMARY
   if (selectedRepName && D.weeklyRollup[selectedRepName]) {
     const wr = D.weeklyRollup[selectedRepName];
     const bestLabel = wr.bestDay ? new Date(wr.bestDay.date + 'T12:00:00').toLocaleDateString('en-AU', { weekday: 'short' }) + ' \\u2014 ' + wr.bestDay.dials + ' dials, $' + wr.bestDay.revenue : 'N/A';
@@ -1212,7 +1747,7 @@ function renderToday() {
       + '</div></div>';
   } else { $('weeklySection').innerHTML = ''; }
 
-  // ── COLD EMAIL SUMMARY ──
+  // COLD EMAIL SUMMARY
   if (D.eb && D.eb.attribution.total > 0) {
     const a = D.eb.attribution;
     if (selectedRepName) {
@@ -1250,16 +1785,41 @@ function renderToday() {
         + '</div></div>';
     }
   } else { $('todayCESection').innerHTML = ''; }
-} // end renderToday
+
+  // REP COMPARISON (merged from old Reps tab) — only show in team view
+  if (!selectedRepName) {
+    const activeReps = D.reps.filter(r => D.activeReps.includes(r.name));
+    if (activeReps.length > 0) {
+      let rcHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4"><h2 class="text-base font-semibold text-gray-800 mb-3">Rep Comparison</h2>'
+        + '<div class="overflow-x-auto"><table class="w-full text-sm">'
+        + '<thead><tr class="border-b text-xs text-gray-500 uppercase tracking-wide">'
+        + '<th class="text-left py-2">Rep</th><th class="text-right py-2">Deals</th><th class="text-right py-2">Won</th><th class="text-right py-2">Lost</th><th class="text-right py-2">Win%</th><th class="text-right py-2">MRR</th><th class="text-right py-2">Cycle</th><th class="text-right py-2">$/Activity</th>'
+        + '</tr></thead><tbody>';
+      for (const r of activeReps) {
+        rcHTML += '<tr class="border-b border-gray-50">'
+          + '<td class="py-2 font-medium">' + r.name + '</td>'
+          + '<td class="text-right py-2">' + r.total + '</td>'
+          + '<td class="text-right py-2 text-green-600 font-medium">' + r.won + '</td>'
+          + '<td class="text-right py-2 text-red-500">' + r.lost + '</td>'
+          + '<td class="text-right py-2">' + r.winRate + '%</td>'
+          + '<td class="text-right py-2 font-bold text-green-600">$' + r.wonMRR.toLocaleString() + '</td>'
+          + '<td class="text-right py-2">' + (r.avgCycleDays != null ? r.avgCycleDays + 'd' : '-') + '</td>'
+          + '<td class="text-right py-2 font-medium">$' + (r.efficiency || 0).toFixed(1) + '</td></tr>';
+      }
+      rcHTML += '</tbody></table></div></div>';
+      $('repComparisonSection').innerHTML = rcHTML;
+    }
+  } else { $('repComparisonSection').innerHTML = ''; }
+}
 
 // ═══ SCORECARD & DRILL-DOWN ═══
 function renderScorecard() {
   const dayData = D.historicalByDay[selectedDate] || D.today;
-  const repsWithTargets = Object.keys(D.weeklyRollup).filter(n => n !== 'Unassigned');
+  const repsWithTargets = D.activeReps.filter(n => D.weeklyRollup[n]);
   let behindCount = 0;
 
   let html = '<div class="flex justify-between items-center mb-4">'
-    + '<h2 class="text-base font-semibold text-gray-800">Daily Scorecard — ' + formatDateDisplay(selectedDate) + '</h2>'
+    + '<h2 class="text-base font-semibold text-gray-800">Daily Scorecard \\u2014 ' + formatDateDisplay(selectedDate) + '</h2>'
     + '<span id="behindBadge" class="text-xs font-medium px-2 py-1 rounded-full"></span></div>';
 
   html += '<div class="bg-white rounded-xl border border-gray-100 overflow-x-auto">'
@@ -1311,86 +1871,50 @@ function renderScorecard() {
 
 function toggleDrillDown(repName) {
   if (drillDownRep === repName) {
-    drillDownRep = null;
-    $('drilldownSection').classList.add('hidden');
-    $('drilldownSection').innerHTML = '';
-    renderScorecard();
-    return;
+    drillDownRep = null; $('drilldownSection').classList.add('hidden'); $('drilldownSection').innerHTML = ''; renderScorecard(); return;
   }
-  drillDownRep = repName;
-  renderScorecard();
-
-  const wr = D.weeklyRollup[repName];
-  const rep = D.reps.find(r => r.name === repName);
-  const a = D.eb?.attribution?.byRep?.[repName];
-  const ceDeals = D.eb?.repCEDeals?.[repName] || [];
+  drillDownRep = repName; renderScorecard();
+  const wr = D.weeklyRollup[repName]; const rep = D.reps.find(r => r.name === repName);
+  const a = D.eb?.attribution?.byRep?.[repName]; const ceDeals = D.eb?.repCEDeals?.[repName] || [];
 
   let html = '<div class="bg-white rounded-xl border border-blue-200 p-5 shadow-sm">'
     + '<div class="flex justify-between items-start mb-4">'
-    + '<h2 class="text-base font-semibold text-gray-800">' + repName + ' — 7-Day Drill-Down</h2>'
+    + '<h2 class="text-base font-semibold text-gray-800">' + repName + ' \\u2014 7-Day Drill-Down</h2>'
     + '<button onclick="toggleDrillDown(\\'' + repName.replace("'", "\\\\'") + '\\')" class="text-xs text-gray-400 hover:text-gray-600">Close</button></div>';
-
-  // 7-day activity table
   if (wr && wr.days.length > 0) {
     html += '<div class="overflow-x-auto mb-4"><table class="w-full text-xs">'
-      + '<thead><tr class="border-b text-gray-500 uppercase">'
-      + '<th class="text-left py-2 px-2">Day</th><th class="text-right py-2 px-2">Dials</th><th class="text-right py-2 px-2">Hours</th><th class="text-right py-2 px-2">Mtgs</th><th class="text-right py-2 px-2">Revenue</th>'
-      + '</tr></thead><tbody>';
+      + '<thead><tr class="border-b text-gray-500 uppercase"><th class="text-left py-2 px-2">Day</th><th class="text-right py-2 px-2">Dials</th><th class="text-right py-2 px-2">Hours</th><th class="text-right py-2 px-2">Mtgs</th><th class="text-right py-2 px-2">Revenue</th></tr></thead><tbody>';
     for (const d of wr.days) {
       const dayLabel = new Date(d.date + 'T12:00:00').toLocaleDateString('en-AU', { weekday: 'short', day: 'numeric', month: 'short' });
-      html += '<tr class="border-b border-gray-50">'
-        + '<td class="py-1.5 px-2">' + dayLabel + '</td>'
-        + '<td class="text-right py-1.5 px-2 font-medium">' + d.uniqueCalls + '</td>'
-        + '<td class="text-right py-1.5 px-2">' + d.callHours + 'h</td>'
-        + '<td class="text-right py-1.5 px-2">' + d.meetings + '</td>'
-        + '<td class="text-right py-1.5 px-2 font-medium">$' + d.dailyRevenue + '</td>'
-        + '</tr>';
+      html += '<tr class="border-b border-gray-50"><td class="py-1.5 px-2">' + dayLabel + '</td><td class="text-right py-1.5 px-2 font-medium">' + d.uniqueCalls + '</td><td class="text-right py-1.5 px-2">' + d.callHours + 'h</td><td class="text-right py-1.5 px-2">' + d.meetings + '</td><td class="text-right py-1.5 px-2 font-medium">$' + d.dailyRevenue + '</td></tr>';
     }
-    html += '<tr class="font-bold border-t"><td class="py-1.5 px-2">Total</td>'
-      + '<td class="text-right py-1.5 px-2">' + wr.totDials + '</td>'
-      + '<td class="text-right py-1.5 px-2">' + wr.totHours + 'h</td>'
-      + '<td class="text-right py-1.5 px-2">' + wr.totMeetings + '</td>'
-      + '<td class="text-right py-1.5 px-2">$' + wr.totRevenue + '</td></tr>'
-      + '</tbody></table></div>';
+    html += '<tr class="font-bold border-t"><td class="py-1.5 px-2">Total</td><td class="text-right py-1.5 px-2">' + wr.totDials + '</td><td class="text-right py-1.5 px-2">' + wr.totHours + 'h</td><td class="text-right py-1.5 px-2">' + wr.totMeetings + '</td><td class="text-right py-1.5 px-2">$' + wr.totRevenue + '</td></tr></tbody></table></div>';
   }
-
-  // Pipeline + EB attribution
   html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-3">';
-  if (rep) {
-    html += card('Open Deals', rep.open, BLUE, rep.total + ' total')
-      + card('Won MRR', fmt(rep.wonMRR), GREEN, rep.won + ' deals')
-      + card('Win Rate', pct(rep.winRate), rep.winRate >= 30 ? GREEN : AMBER, '');
-  }
-  if (a && a.total > 0) {
-    html += card('CE Deals', a.total, CYAN, fmt(a.wonMRR) + ' won MRR');
-  }
+  if (rep) { html += card('Open Deals', rep.open, BLUE, rep.total + ' total') + card('Won MRR', fmt(rep.wonMRR), GREEN, rep.won + ' deals') + card('Win Rate', pct(rep.winRate), rep.winRate >= 30 ? GREEN : AMBER, ''); }
+  if (a && a.total > 0) { html += card('CE Deals', a.total, CYAN, fmt(a.wonMRR) + ' won MRR'); }
   html += '</div>';
-
-  // CE deal list
   if (ceDeals.length > 0) {
     html += '<div class="mt-3"><p class="text-xs font-medium text-gray-500 uppercase mb-2">Cold Email Deals</p><div class="space-y-1">';
-    for (const d of ceDeals.filter(dd => !dd.lost).slice(0, 8)) {
-      const sc = d.won ? 'text-green-600' : 'text-blue-600';
-      html += '<div class="flex justify-between text-xs py-1"><span class="truncate flex-1">' + d.name + '</span><span class="' + sc + ' font-medium ml-2">$' + d.value + '</span></div>';
-    }
+    for (const d of ceDeals.filter(dd => !dd.lost).slice(0, 8)) { const sc = d.won ? 'text-green-600' : 'text-blue-600'; html += '<div class="flex justify-between text-xs py-1"><span class="truncate flex-1">' + d.name + '</span><span class="' + sc + ' font-medium ml-2">$' + d.value + '</span></div>'; }
     html += '</div></div>';
   }
-
-  html += '</div>';
-  $('drilldownSection').innerHTML = html;
-  $('drilldownSection').classList.remove('hidden');
+  html += '</div>'; $('drilldownSection').innerHTML = html; $('drilldownSection').classList.remove('hidden');
 }
 
 // ═══ TAB 2: PIPELINE ═══
 function renderPipeline() {
+  const pc = D.pipelineCoverage;
+  const coverageColor = pc.ratio >= 3 ? GREEN : (pc.ratio >= 1 ? AMBER : RED);
   $('pipelineKPIs').innerHTML = [
     card('Open Pipeline', fmt(D.totalPipelineValue), BLUE, (D.totalDeals-D.totalWon-D.totalLost)+' open'),
     card('Weighted', fmt(D.weightedPipelineValue), PURPLE, 'probability-adjusted'),
     card('Win Rate', pct(D.winRate), D.winRate>=30?GREEN:AMBER, D.totalWon+' won / '+D.totalLost+' lost'),
     card('Won Value', fmt(D.wonValue), GREEN, D.totalWon+' deals'),
+    card('Coverage', pc.ratio + 'x', coverageColor, pc.ratio >= 3 ? 'Healthy' : 'Gap: ' + fmt(pc.gap)),
   ].join('');
 
-  charts.pipeline = new Chart($('pipelineChart'), { type:'bar', data:{ labels:D.pipeline.map(s=>s.label), datasets:[{ label:'Deals', data:D.pipeline.map(s=>s.count), backgroundColor:BLUE, borderRadius:4 }] }, options:{ indexAxis:'y', responsive:true, plugins:{ legend:{display:false}, title:{display:true,text:'Deals by Stage'} }, scales:{ x:{beginAtZero:true} } } });
+  charts.pipeline = new Chart($('pipelineChart'), { type:'bar', data:{ labels:D.pipeline.map(s=>s.label), datasets:[{ label:'Deals', data:D.pipeline.map(s=>s.count), backgroundColor:D.bottlenecks.stageMetrics.map(sm => sm.isBottleneck ? RED : BLUE).concat([LGRAY, GREEN]), borderRadius:4 }] }, options:{ indexAxis:'y', responsive:true, plugins:{ legend:{display:false}, title:{display:true,text:'Deals by Stage (red = bottleneck)'} }, scales:{ x:{beginAtZero:true} } } });
 
   // Stage Conversion
   if (D.stageConversion && D.stageConversion.length > 0) {
@@ -1411,53 +1935,82 @@ function renderPipeline() {
     charts.touchVelocity = new Chart($('touchVelocityChart'), { type:'bar', data:{ labels:tv.map(s=>s.label), datasets:[{ label:'Avg Touches/Deal', data:tv.map(s=>s.avgTouches), backgroundColor:tv.map(s=>s.avgTouches>20?GREEN:(s.avgTouches>5?BLUE:AMBER)), borderRadius:4 }] }, options:{ responsive:true, plugins:{legend:{display:false},title:{display:true,text:'Avg Activities per Deal (30d)'}}, scales:{y:{beginAtZero:true}} } });
   }
 
-  // Deal Health
-  if (D.dealHealth) {
-    const dh = D.dealHealth;
+  // Deal Health Scores (NEW - composite scoring)
+  if (D.dealHealthScores) {
+    const dhs = D.dealHealthScores;
     let dhHTML = '<div class="grid grid-cols-4 gap-2 mb-3 text-center">'
-      + '<div><p class="text-lg font-bold" style="color:' + GREEN + '">' + dh.healthy + '</p><p class="text-xs text-gray-500">Healthy</p></div>'
-      + '<div><p class="text-lg font-bold" style="color:' + AMBER + '">' + dh.needsAttention + '</p><p class="text-xs text-gray-500">Attention</p></div>'
-      + '<div><p class="text-lg font-bold" style="color:' + RED + '">' + dh.stale + '</p><p class="text-xs text-gray-500">Stale</p></div>'
-      + '<div><p class="text-lg font-bold" style="color:' + RED + '">' + dh.critical + '</p><p class="text-xs text-gray-500">Critical</p></div>'
-      + '</div>';
-    const badDeals = dh.deals.filter(d => d.health !== 'healthy').slice(0, 10);
-    if (badDeals.length > 0) {
+      + '<div><p class="text-lg font-bold" style="color:' + GREEN + '">' + dhs.counts.healthy + '</p><p class="text-xs text-gray-500">Healthy</p></div>'
+      + '<div><p class="text-lg font-bold" style="color:' + AMBER + '">' + dhs.counts.monitor + '</p><p class="text-xs text-gray-500">Monitor</p></div>'
+      + '<div><p class="text-lg font-bold" style="color:#ea580c">' + dhs.counts.attention + '</p><p class="text-xs text-gray-500">Attention</p></div>'
+      + '<div><p class="text-lg font-bold" style="color:' + RED + '">' + dhs.counts.critical + '</p><p class="text-xs text-gray-500">Critical</p></div></div>';
+    const worstDeals = dhs.deals.filter(d => d.category !== 'healthy').slice(0, 10);
+    if (worstDeals.length > 0) {
       dhHTML += '<div class="space-y-1">';
-      for (const d of badDeals) {
-        const hc = d.health === 'critical' ? RED : (d.health === 'stale' ? RED : AMBER);
+      for (const d of worstDeals) {
+        const cls = 'score-' + d.category;
         dhHTML += '<div class="flex items-center justify-between text-xs py-1 border-b border-gray-50">'
-          + '<span class="health-dot mr-2" style="background:' + hc + '"></span>'
+          + '<span class="' + cls + ' text-[10px] font-bold px-1.5 py-0.5 rounded mr-2">' + d.score + '</span>'
           + '<a href="https://app.hubspot.com/contacts/' + PORTAL + '/deal/' + d.id + '" target="_blank" class="truncate flex-1 hover:text-blue-600">' + d.name + '</a>'
           + '<span class="text-gray-400 mx-2">' + d.stage + '</span>'
-          + '<span class="font-medium" style="color:' + hc + '">' + (d.daysSinceUpdate != null ? d.daysSinceUpdate + 'd idle' : 'unknown') + '</span></div>';
+          + '<span class="text-gray-500">' + d.daysSinceUpdate + 'd idle</span></div>';
       }
       dhHTML += '</div>';
     }
-    $('dealHealthSection').innerHTML = dhHTML;
+    $('dealHealthScoresSection').innerHTML = dhHTML;
   }
 
-  // Deals needing attention
-  const stale = D.dealHealth ? D.dealHealth.deals.filter(d => d.health === 'stale' || d.health === 'critical') : D.velocity.staleDeals;
-  const shown = stale.slice(0, 15);
-  if (shown.length > 0) {
-    let daHTML = '<div class="space-y-2">';
-    for (const d of shown) {
-      const dc = (d.daysSinceUpdate || d.days || 0) > 30 ? 'text-red-600 font-bold' : 'text-amber-600';
-      daHTML += '<a href="https://app.hubspot.com/contacts/' + PORTAL + '/deal/' + d.id + '" target="_blank" class="flex items-center justify-between p-3 rounded-lg hover:bg-gray-50 border border-gray-50">'
-        + '<div class="min-w-0 flex-1"><p class="text-sm font-medium text-gray-800 truncate">' + d.name + '</p><p class="text-xs text-gray-400">' + (d.rep || '') + '</p></div>'
-        + '<span class="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 mx-2">' + d.stage + '</span>'
-        + '<span class="text-sm ' + dc + '">' + (d.daysSinceUpdate != null ? d.daysSinceUpdate + 'd idle' : d.days + 'd old') + '</span></a>';
+  // Stale Deal Triage (NEW - grouped by severity)
+  if (D.dealHealthScores) {
+    const allDeals = D.dealHealthScores.deals;
+    const tiers = [
+      { label: '60+ days', min: 60, color: RED, deals: allDeals.filter(d => d.daysSinceUpdate >= 60) },
+      { label: '30-59 days', min: 30, color: '#ea580c', deals: allDeals.filter(d => d.daysSinceUpdate >= 30 && d.daysSinceUpdate < 60) },
+      { label: '14-29 days', min: 14, color: AMBER, deals: allDeals.filter(d => d.daysSinceUpdate >= 14 && d.daysSinceUpdate < 30) },
+      { label: '7-13 days', min: 7, color: BLUE, deals: allDeals.filter(d => d.daysSinceUpdate >= 7 && d.daysSinceUpdate < 14) },
+    ];
+    let triageHTML = '<div class="grid grid-cols-4 gap-2 mb-4">';
+    for (const t of tiers) {
+      triageHTML += '<div class="text-center p-2 rounded-lg" style="background:' + t.color + '10"><p class="text-lg font-bold" style="color:' + t.color + '">' + t.deals.length + '</p><p class="text-xs text-gray-500">' + t.label + '</p></div>';
     }
-    daHTML += '</div>';
-    if (stale.length > 15) daHTML += '<p class="text-xs text-gray-400 mt-2">+ ' + (stale.length - 15) + ' more</p>';
-    $('dealsAttentionSection').innerHTML = daHTML;
-  } else {
-    $('dealsAttentionSection').innerHTML = '<p class="text-green-600 text-sm font-medium py-4 text-center">All deals healthy!</p>';
+    triageHTML += '</div>';
+    const showDeals = tiers.flatMap(t => t.deals).slice(0, 15);
+    if (showDeals.length > 0) {
+      triageHTML += '<div class="space-y-2">';
+      for (const d of showDeals) {
+        const dc = d.daysSinceUpdate >= 60 ? 'text-red-600 font-bold' : (d.daysSinceUpdate >= 30 ? 'text-orange-600' : 'text-amber-600');
+        triageHTML += '<a href="https://app.hubspot.com/contacts/' + PORTAL + '/deal/' + d.id + '" target="_blank" class="flex items-center justify-between p-3 rounded-lg hover:bg-gray-50 border border-gray-50">'
+          + '<div class="min-w-0 flex-1"><p class="text-sm font-medium text-gray-800 truncate">' + d.name + '</p><p class="text-xs text-gray-400">' + d.rep + '</p></div>'
+          + '<span class="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 mx-2">' + d.stage + '</span>'
+          + '<span class="text-sm ' + dc + '">' + d.daysSinceUpdate + 'd idle</span></a>';
+      }
+      triageHTML += '</div>';
+    } else {
+      triageHTML += '<p class="text-green-600 text-sm font-medium py-4 text-center">All deals are active!</p>';
+    }
+    $('staleDealTriageSection').innerHTML = triageHTML;
   }
 }
 
 // ═══ TAB 3: CHANNELS ═══
 function renderChannels() {
+  // Data Quality Banner
+  if (D.dataQuality) {
+    const dq = D.dataQuality;
+    const bannerColor = dq.sourcePct >= 80 ? 'bg-green-50 border-green-200 text-green-700' : (dq.sourcePct >= 50 ? 'bg-amber-50 border-amber-200 text-amber-700' : 'bg-red-50 border-red-200 text-red-700');
+    let dqHTML = '<div class="' + bannerColor + ' border rounded-xl p-4 mb-2">'
+      + '<h3 class="text-sm font-semibold mb-2">Data Quality</h3>'
+      + '<div class="grid grid-cols-4 gap-3 text-xs">'
+      + '<div>Source Known: <b>' + dq.sourcePct + '%</b></div>'
+      + '<div>Owner Assigned: <b>' + dq.ownerPct + '%</b></div>'
+      + '<div>Tier Set: <b>' + dq.tierPct + '%</b></div>'
+      + '<div>EB Sync: <b>' + (dq.ebSyncOk ? 'OK' : 'Issue') + '</b></div></div>';
+    if (D.sourceAttribution && D.sourceAttribution.improved > 0) {
+      dqHTML += '<p class="text-xs mt-2">Attribution fallback recovered ' + D.sourceAttribution.improved + ' deals from unknown</p>';
+    }
+    dqHTML += '</div>';
+    $('dataQualityBanner').innerHTML = dqHTML;
+  }
+
   // Source Attribution Table
   let satHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4"><h2 class="text-base font-semibold text-gray-800 mb-3">Source Attribution</h2>'
     + '<div class="overflow-x-auto"><table class="w-full text-sm">'
@@ -1477,10 +2030,8 @@ function renderChannels() {
   satHTML += '</tbody></table></div></div>';
   $('sourceAttributionSection').innerHTML = satHTML;
 
-  // Source charts
   charts.source = new Chart($('sourceChart'), { type:'bar', data:{ labels:D.sourceStats.map(s=>s.label), datasets:[ {label:'Won',data:D.sourceStats.map(s=>s.won),backgroundColor:GREEN,borderRadius:4}, {label:'Lost',data:D.sourceStats.map(s=>s.lost),backgroundColor:RED,borderRadius:4}, {label:'Open',data:D.sourceStats.map(s=>s.open),backgroundColor:LGRAY,borderRadius:4} ] }, options:{ responsive:true, plugins:{title:{display:true,text:'Deals by Source'}}, scales:{y:{beginAtZero:true}} } });
 
-  // Source cycle chart
   if (D.sourceCycle) {
     const srcs = Object.values(D.sourceCycle).filter(s => s.count > 0);
     if (srcs.length > 0) {
@@ -1488,11 +2039,12 @@ function renderChannels() {
     }
   }
 
-  // EB Funnel + Cost Metrics
+  // EB Funnel
   if (D.eb) {
     const eb = D.eb, t = eb.totals, a = eb.attribution, co = eb.costs;
-    let ebHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4"><h2 class="text-base font-semibold text-gray-800 mb-3">EmailBison Funnel</h2>'
-      + '<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">'
+    let ebHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4"><h2 class="text-base font-semibold text-gray-800 mb-3">EmailBison Funnel</h2>';
+    if (!eb.syncHealthy) { ebHTML += '<div class="alert-warning border rounded-lg px-3 py-1.5 text-xs mb-3">All leads show same status \\u2014 EB sync may be stale. Raw statuses: ' + Object.entries(eb.debugStatuses).map(function(e){return e[0]+'='+e[1]}).join(', ') + '</div>'; }
+    ebHTML += '<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">'
       + '<div><canvas id="ebFunnelChart" height="200"></canvas></div>'
       + '<div class="grid grid-cols-2 gap-3">'
       + card('Leads', t.leads.toLocaleString(), BLUE, eb.campaignMetrics.length + ' campaigns')
@@ -1509,7 +2061,7 @@ function renderChannels() {
       charts.ebFunnel = new Chart($('ebFunnelChart'), { type:'bar', data:{ labels:eb.funnel.map(f=>f.label), datasets:[{data:eb.funnel.map(f=>f.value),backgroundColor:fc.slice(0,eb.funnel.length),borderRadius:4}] }, options:{indexAxis:'y',responsive:true,plugins:{legend:{display:false}},scales:{x:{beginAtZero:true}}} });
     }
 
-    // Campaign cards
+    // Campaign cards with ROI
     let ccHTML = '<h3 class="text-sm font-medium text-gray-500 mb-3">Campaign Performance</h3><div class="grid grid-cols-1 md:grid-cols-2 gap-3">';
     for (const c of eb.campaignMetrics) {
       const sb = c.status==='active'?'bg-green-50 text-green-600':(c.status==='paused'?'bg-amber-50 text-amber-600':'bg-gray-100 text-gray-600');
@@ -1521,8 +2073,7 @@ function renderChannels() {
         + '<div><p class="text-gray-500">Opens</p><p class="font-bold">' + c.opens + ' (' + c.openRate + '%)</p></div>'
         + '<div><p class="text-gray-500">Replies</p><p class="font-bold text-blue-600">' + c.replies + '</p></div>'
         + '<div><p class="text-gray-500">Interested</p><p class="font-bold text-green-600">' + c.interested + '</p></div>'
-        + '<div><p class="text-gray-500">Reply%</p><p class="font-bold">' + c.replyRate + '%</p></div>'
-        + '</div></div>';
+        + '<div><p class="text-gray-500">Spend</p><p class="font-bold">$' + c.allocatedSpend + '</p></div></div></div>';
     }
     ccHTML += '</div>';
     $('ebCampaignSection').innerHTML = ccHTML;
@@ -1551,78 +2102,65 @@ function renderChannels() {
       + '<p class="text-2xl font-bold" style="color:' + (cr.total.roi > 10 ? GREEN : AMBER) + '">' + cr.total.roi + '% ROI</p>'
       + '<p class="text-xs text-gray-500 mt-1">' + fmt(cr.total.spend) + ' spend \\u2192 ' + fmt(cr.total.wonMRR) + ' MRR</p></div></div>';
   }
+
+  // Channel Mix Recommendation (NEW)
+  if (D.bestChannel) {
+    $('channelMixSection').innerHTML = '<div class="bg-green-50 border border-green-200 rounded-xl p-4">'
+      + '<h3 class="text-sm font-semibold text-green-800 mb-1">Best Channel: ' + D.bestChannel.name + '</h3>'
+      + '<p class="text-xs text-green-700">Lowest CAC at ' + (D.bestChannel.cac ? fmt(D.bestChannel.cac) : 'N/A') + ' | ' + D.bestChannel.won + ' deals won | ' + fmt(D.bestChannel.wonMRR) + ' MRR</p></div>';
+  } else { $('channelMixSection').innerHTML = ''; }
 }
 
-// ═══ TAB 4: REPS ═══
-function renderRepsTab() {
-  // Rep Comparison Table
-  const reps = D.reps.filter(r => r.name !== 'Unassigned' && !r.name.startsWith('Owner '));
-  let rcHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4"><h2 class="text-base font-semibold text-gray-800 mb-3">Rep Comparison</h2>'
-    + '<div class="overflow-x-auto"><table class="w-full text-sm">'
-    + '<thead><tr class="border-b text-xs text-gray-500 uppercase tracking-wide">'
-    + '<th class="text-left py-2">Rep</th><th class="text-right py-2">Deals</th><th class="text-right py-2">Won</th><th class="text-right py-2">Lost</th><th class="text-right py-2">Win%</th><th class="text-right py-2">MRR</th><th class="text-right py-2">Cycle</th><th class="text-right py-2">Calls</th><th class="text-right py-2">Mtgs</th><th class="text-right py-2">Notes</th><th class="text-right py-2">$/Activity</th>'
-    + '</tr></thead><tbody>';
-  for (const r of reps) {
-    rcHTML += '<tr class="border-b border-gray-50">'
-      + '<td class="py-2 font-medium">' + r.name + '</td>'
-      + '<td class="text-right py-2">' + r.total + '</td>'
-      + '<td class="text-right py-2 text-green-600 font-medium">' + r.won + '</td>'
-      + '<td class="text-right py-2 text-red-500">' + r.lost + '</td>'
-      + '<td class="text-right py-2">' + r.winRate + '%</td>'
-      + '<td class="text-right py-2 font-bold text-green-600">$' + r.wonMRR.toLocaleString() + '</td>'
-      + '<td class="text-right py-2">' + (r.avgCycleDays != null ? r.avgCycleDays + 'd' : '-') + '</td>'
-      + '<td class="text-right py-2">' + r.calls + '</td>'
-      + '<td class="text-right py-2">' + r.meetings + '</td>'
-      + '<td class="text-right py-2">' + r.notes + '</td>'
-      + '<td class="text-right py-2 font-medium">$' + (r.efficiency || 0).toFixed(1) + '</td></tr>';
-  }
-  rcHTML += '</tbody></table></div></div>';
-  $('repComparisonSection').innerHTML = rcHTML;
-
-  // Activity totals + chart
-  $('actTotals').innerHTML = [
-    card('Calls (30d)', D.actTotals.calls, BLUE, Math.round(D.actTotals.calls/4.3)+'/wk'),
-    card('Meetings (30d)', D.actTotals.meetings, GREEN, Math.round(D.actTotals.meetings/4.3)+'/wk'),
-    card('Notes (30d)', D.actTotals.notes, PURPLE, Math.round(D.actTotals.notes/4.3)+'/wk'),
+// ═══ TAB 4: REVOPS (was Revenue) ═══
+function renderRevOps() {
+  // Unit Economics cards
+  const ue = D.unitEconomics;
+  const ltvColor = ue.ltvCacRatio && ue.ltvCacRatio >= 3 ? GREEN : (ue.ltvCacRatio && ue.ltvCacRatio >= 1 ? AMBER : RED);
+  const paybackColor = ue.monthsToPayback && ue.monthsToPayback <= 6 ? GREEN : (ue.monthsToPayback && ue.monthsToPayback <= 12 ? AMBER : RED);
+  $('unitEconCards').innerHTML = [
+    card('LTV (12mo)', fmt(ue.ltv), BLUE, 'ARPU ' + fmt(ue.arpu) + ' x 12'),
+    card('LTV:CAC', ue.ltvCacRatio ? ue.ltvCacRatio + ':1' : 'N/A', ltvColor, ue.ltvCacRatio >= 3 ? 'Healthy' : 'Below 3:1 target'),
+    card('Payback', ue.monthsToPayback ? ue.monthsToPayback + ' months' : 'N/A', paybackColor, 'CAC / ARPU'),
+    card('Break-Even', ue.currentCustomers + '/' + ue.breakEven, ue.gap === 0 ? GREEN : AMBER, ue.gap > 0 ? ue.gap + ' more needed' : 'Achieved!'),
   ].join('');
-  const dateLabels = D.daily.map(d => new Date(d.date).toLocaleDateString('en-AU',{month:'short',day:'numeric'}));
-  charts.activity = new Chart($('activityChart'), { type:'line', data:{ labels:dateLabels, datasets:[ {label:'Calls',data:D.daily.map(d=>d.calls),borderColor:BLUE,backgroundColor:BLUE+'20',fill:true,tension:0.3}, {label:'Meetings',data:D.daily.map(d=>d.meetings),borderColor:GREEN,backgroundColor:GREEN+'20',fill:true,tension:0.3}, {label:'Notes',data:D.daily.map(d=>d.notes),borderColor:PURPLE,backgroundColor:PURPLE+'20',fill:true,tension:0.3} ] }, options:{ responsive:true, scales:{y:{beginAtZero:true}}, plugins:{legend:{position:'top'}} } });
 
-  // Per-rep channel attribution
-  if (D.repChannelAttribution) {
-    let raHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4"><h3 class="text-sm font-medium text-gray-500 mb-3">Per-Rep Channel Attribution</h3><div class="overflow-x-auto"><table class="w-full text-xs">'
-      + '<thead><tr class="border-b text-gray-500 uppercase"><th class="text-left py-2">Rep</th><th class="text-left py-2">Channel</th><th class="text-right py-2">Deals</th><th class="text-right py-2">Won</th><th class="text-right py-2">MRR</th></tr></thead><tbody>';
-    for (const [repName, channels] of Object.entries(D.repChannelAttribution)) {
-      if (repName === 'Unassigned') continue;
-      for (const [src, data] of Object.entries(channels)) {
-        raHTML += '<tr class="border-b border-gray-50"><td class="py-1.5">' + repName + '</td><td class="py-1.5">' + data.label + '</td>'
-          + '<td class="text-right py-1.5">' + data.total + '</td>'
-          + '<td class="text-right py-1.5 text-green-600">' + data.won + '</td>'
-          + '<td class="text-right py-1.5 font-medium">$' + data.wonMRR.toLocaleString() + '</td></tr>';
-      }
+  // MRR Waterfall
+  const mw = D.mrrWaterfall;
+  charts.mrrWaterfall = new Chart($('mrrWaterfallChart'), {
+    type: 'bar',
+    data: {
+      labels: ['New MRR', 'Churn', 'Net'],
+      datasets: [{
+        data: [mw.newMRR, -mw.churnMRR, mw.netMRR],
+        backgroundColor: [GREEN, RED, mw.netMRR >= 0 ? BLUE : RED],
+        borderRadius: 4,
+      }]
+    },
+    options: { responsive: true, plugins: { legend: { display: false }, title: { display: true, text: 'MRR Movement (' + mw.newDeals + ' new, ' + mw.churnCount + ' churned)' } }, scales: { y: { beginAtZero: true } } }
+  });
+
+  // Week-over-Week
+  if (D.woW) {
+    const w = D.woW;
+    function wowRow(label, tw, lw, d) {
+      const arrow = d >= 0 ? '\\u2191' : '\\u2193';
+      const cls = d >= 0 ? 'wow-up' : 'wow-down';
+      return '<tr class="border-b border-gray-50"><td class="py-2 text-sm">' + label + '</td>'
+        + '<td class="text-right py-2 font-medium">' + tw + '</td>'
+        + '<td class="text-right py-2 text-gray-400">' + lw + '</td>'
+        + '<td class="text-right py-2 ' + cls + ' font-bold">' + arrow + ' ' + Math.abs(d) + '%</td></tr>';
     }
-    raHTML += '</tbody></table></div></div>';
-    $('repChannelSection').innerHTML = raHTML;
+    $('wowSection').innerHTML = '<table class="w-full text-sm">'
+      + '<thead><tr class="border-b text-xs text-gray-500 uppercase"><th class="text-left py-2">Metric</th><th class="text-right py-2">This Week</th><th class="text-right py-2">Last Week</th><th class="text-right py-2">Delta</th></tr></thead><tbody>'
+      + wowRow('Calls', w.thisWeek.calls, w.lastWeek.calls, w.deltas.calls)
+      + wowRow('Unique Dials', w.thisWeek.uniqueDials, w.lastWeek.uniqueDials, w.deltas.uniqueDials)
+      + wowRow('Meetings', w.thisWeek.meetings, w.lastWeek.meetings, w.deltas.meetings)
+      + wowRow('Revenue', '$' + w.thisWeek.revenue, '$' + w.lastWeek.revenue, w.deltas.revenue)
+      + wowRow('Deals Created', w.thisWeek.dealsCreated, w.lastWeek.dealsCreated, w.deltas.dealsCreated)
+      + wowRow('Deals Won', w.thisWeek.dealsWon, w.lastWeek.dealsWon, w.deltas.dealsWon)
+      + '</tbody></table>';
   }
 
-  // Rep cards
-  $('repCards').innerHTML = reps.map(r => {
-    const initials = r.name.split(' ').map(w=>w[0]).join('').toUpperCase();
-    const color = reps.indexOf(r) % 3 === 0 ? BLUE : (reps.indexOf(r) % 3 === 1 ? PURPLE : GREEN);
-    return '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-      +'<div class="flex items-center gap-3 mb-3"><div class="w-9 h-9 rounded-full flex items-center justify-center text-white text-xs font-bold" style="background:'+color+'">'+initials+'</div><div><p class="font-semibold text-sm">'+r.name+'</p><p class="text-xs text-gray-400">'+r.total+' deals</p></div></div>'
-      +'<div class="grid grid-cols-3 gap-2 text-xs">'
-      +'<div><p class="text-gray-500">Won</p><p class="font-bold text-green-600">'+r.won+'</p></div>'
-      +'<div><p class="text-gray-500">Lost</p><p class="font-bold text-red-500">'+r.lost+'</p></div>'
-      +'<div><p class="text-gray-500">Win%</p><p class="font-bold">'+r.winRate+'%</p></div>'
-      +'<div><p class="text-gray-500">MRR</p><p class="font-bold text-green-600">$'+r.wonMRR.toLocaleString()+'</p></div>'
-      +'<div><p class="text-gray-500">Cycle</p><p class="font-bold">'+(r.avgCycleDays!=null?r.avgCycleDays+'d':'N/A')+'</p></div>'
-      +'<div><p class="text-gray-500">Open</p><p class="font-bold">'+r.open+'</p></div></div></div>';
-  }).join('');
-}
-
-// ═══ TAB 5: REVENUE ═══
-function renderRevenue() {
   // P&L
   const profitColor = D.pnl.monthlyProfit >= 0 ? GREEN : RED;
   const roiColor = D.pnl.roi > 0 ? GREEN : (D.pnl.roi > -25 ? AMBER : RED);
@@ -1651,6 +2189,16 @@ function renderRevenue() {
     $('mrrLegend').innerHTML = mrrLabels.map((l,i) => '<div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full" style="background:'+mrrColors[i]+'"></span><span>'+l+': <b>'+mrrValues[i]+'</b></span></div>').join('');
   }
 
+  // Engagement Score Distribution
+  const ET = D.engagementTiers;
+  if (ET && (ET.onFire + ET.hot + ET.warm + ET.cold) > 0) {
+    const engLabels = ['On Fire', 'Hot', 'Warm', 'Cold'];
+    const engValues = [ET.onFire, ET.hot, ET.warm, ET.cold];
+    const engColors = [RED, AMBER, BLUE, GRAY];
+    charts.engScore = new Chart($('engScoreChart'), { type:'doughnut', data:{ labels:engLabels, datasets:[{ data:engValues, backgroundColor:engColors }] }, options:{ plugins:{ legend:{ display:false } }, cutout:'60%' } });
+    $('engScoreLegend').innerHTML = engLabels.map((l,i) => '<div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full" style="background:'+engColors[i]+'"></span><span>'+l+': <b>'+engValues[i]+'</b></span></div>').join('');
+  }
+
   // Funnel
   const F = D.funnel;
   charts.funnel = new Chart($('funnelChart'), { type:'bar', data:{ labels:['All Contacts','Started Trial','Active Trial','Paid'], datasets:[{ data:[F.totalContacts,F.activeTrial+F.paid+F.expired+F.churned,F.activeTrial,F.paid], backgroundColor:[LGRAY,CYAN,BLUE,GREEN], borderRadius:4 }] }, options:{ indexAxis:'y', responsive:true, plugins:{legend:{display:false},title:{display:true,text:'Conversion Funnel'}}, scales:{x:{beginAtZero:true}} } });
@@ -1668,16 +2216,13 @@ function renderRevenue() {
     const wf = D.weightedForecast;
     $('forecastSection').innerHTML = '<h2 class="text-base font-semibold text-gray-800 mb-3">Weighted Forecast</h2>'
       + '<div class="grid grid-cols-1 md:grid-cols-3 gap-4">'
-      + '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-      + '<h3 class="text-sm font-medium text-gray-500 mb-1">This Month</h3>'
+      + '<div class="bg-white rounded-xl border border-gray-100 p-4"><h3 class="text-sm font-medium text-gray-500 mb-1">This Month</h3>'
       + '<p class="text-2xl font-bold" style="color:' + GREEN + '">' + fmt(wf.thisMonth.weighted) + '</p>'
       + '<p class="text-xs text-gray-400">' + wf.thisMonth.deals + ' deals | ' + fmt(wf.thisMonth.value) + ' unweighted</p></div>'
-      + '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-      + '<h3 class="text-sm font-medium text-gray-500 mb-1">Next Month</h3>'
+      + '<div class="bg-white rounded-xl border border-gray-100 p-4"><h3 class="text-sm font-medium text-gray-500 mb-1">Next Month</h3>'
       + '<p class="text-2xl font-bold" style="color:' + BLUE + '">' + fmt(wf.nextMonth.weighted) + '</p>'
       + '<p class="text-xs text-gray-400">' + wf.nextMonth.deals + ' deals | ' + fmt(wf.nextMonth.value) + ' unweighted</p></div>'
-      + '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-      + '<h3 class="text-sm font-medium text-gray-500 mb-1">Later</h3>'
+      + '<div class="bg-white rounded-xl border border-gray-100 p-4"><h3 class="text-sm font-medium text-gray-500 mb-1">Later</h3>'
       + '<p class="text-2xl font-bold" style="color:' + PURPLE + '">' + fmt(wf.later.weighted) + '</p>'
       + '<p class="text-xs text-gray-400">' + wf.later.deals + ' deals | ' + fmt(wf.later.value) + ' unweighted</p></div></div>';
   }
@@ -1701,7 +2246,6 @@ function renderRevenue() {
 updateDateUI();
 switchTab(activeTab);
 
-// Auto-refresh preserving query params
 setTimeout(() => window.location.reload(), 300000);
 <\/script>
 </body>
@@ -1715,7 +2259,7 @@ function loadingHTML() {
 <body class="bg-gray-50 min-h-screen flex items-center justify-center">
 <div class="text-center"><div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto"></div>
 <p class="mt-4 text-gray-600 text-lg">Loading dashboard...</p>
-<p class="mt-2 text-gray-400 text-sm">Pulling live data from HubSpot</p>
+<p class="mt-2 text-gray-400 text-sm">Pulling live data from HubSpot + EmailBison</p>
 </div></body></html>`;
 }
 
@@ -1730,8 +2274,11 @@ async function refreshCache() {
     const data = computeMetrics(raw);
     cache.data = data;
     cache.time = Date.now();
+    cache.lastError = null;
+    cache.lastSuccess = Date.now();
     console.log('[cache] Refreshed at ' + new Date().toISOString());
   } catch (err) {
+    cache.lastError = err.message || 'Unknown error';
     console.error('[cache] Refresh failed:', err.response?.data?.message || err.message);
   } finally {
     cache.loading = false;
@@ -1746,6 +2293,11 @@ app.get('/health', (req, res) => res.send('ok'));
 app.get('/api/data', (req, res) => {
   if (!cache.data) return res.status(503).json({ status: 'loading' });
   res.json(cache.data);
+});
+
+app.get('/api/eb-debug', (req, res) => {
+  if (!cache.data || !cache.data.eb) return res.status(503).json({ status: 'no eb data' });
+  res.json({ statuses: cache.data.eb.debugStatuses, syncHealthy: cache.data.eb.syncHealthy, campaigns: cache.data.eb.campaignMetrics.length });
 });
 
 app.get('/refresh', async (req, res) => {
