@@ -1318,73 +1318,218 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sammy AI - RevOps Dashboard</title>
-<script src="https://cdn.tailwindcss.com"><\/script>
+<title>Sammy AI - RevOps</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
-  body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
-  .progress-bar { transition: width 0.5s ease; }
-  .tab-btn { transition: all 0.15s ease; }
-  .tab-btn.active { background: #3b82f6; color: white; }
-  .tab-btn:not(.active) { background: #f9fafb; color: #4b5563; }
-  .tab-btn:not(.active):hover { background: #f3f4f6; }
-  .health-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
-  .sparkline { display: inline-block; vertical-align: middle; }
-  .alert-critical { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
-  .alert-warning { background: #fffbeb; border-color: #fde68a; color: #92400e; }
-  .alert-info { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
-  .score-healthy { background: #dcfce7; color: #166534; }
-  .score-monitor { background: #fef9c3; color: #854d0e; }
-  .score-attention { background: #fed7aa; color: #9a3412; }
-  .score-critical { background: #fecaca; color: #991b1b; }
-  .wow-up { color: #16a34a; }
-  .wow-down { color: #dc2626; }
+  :root {
+    --bg: #f5f5f7; --surface: #ffffff; --surface-hover: #fafafa;
+    --text-primary: #1d1d1f; --text-secondary: #6e6e73; --text-tertiary: #aeaeb2;
+    --border: rgba(0,0,0,0.06); --border-strong: rgba(0,0,0,0.1);
+    --blue: #007aff; --green: #34c759; --red: #ff3b30; --orange: #ff9500;
+    --purple: #af52de; --teal: #5ac8fa; --indigo: #5856d6;
+    --blue-bg: rgba(0,122,255,0.08); --green-bg: rgba(52,199,89,0.08);
+    --red-bg: rgba(255,59,48,0.08); --orange-bg: rgba(255,149,0,0.08);
+    --radius: 16px; --radius-sm: 10px; --radius-xs: 6px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.02);
+    --shadow-md: 0 4px 12px rgba(0,0,0,0.06), 0 1px 3px rgba(0,0,0,0.04);
+    --shadow-lg: 0 8px 30px rgba(0,0,0,0.08), 0 2px 8px rgba(0,0,0,0.04);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', system-ui, sans-serif; background: var(--bg); color: var(--text-primary); -webkit-font-smoothing: antialiased; line-height: 1.47; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 0 24px; }
+
+  /* ── Header ── */
+  .header { position: sticky; top: 0; z-index: 100; background: rgba(255,255,255,0.72); backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px); border-bottom: 0.5px solid var(--border-strong); }
+  .header-inner { padding: 12px 0 0; }
+  .header-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .brand { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
+  .brand span { font-weight: 400; color: var(--text-tertiary); font-size: 12px; margin-left: 6px; }
+  .timestamp { font-size: 11px; color: var(--text-tertiary); margin-top: 1px; }
+  .controls { display: flex; align-items: center; gap: 10px; }
+  .controls select { font-size: 13px; padding: 6px 12px; border: 0.5px solid var(--border-strong); border-radius: var(--radius-xs); background: var(--surface); color: var(--text-primary); outline: none; appearance: none; cursor: pointer; }
+  .controls select:focus { box-shadow: 0 0 0 3px var(--blue-bg); }
+  .date-nav { display: flex; align-items: center; gap: 2px; background: var(--surface); border: 0.5px solid var(--border-strong); border-radius: var(--radius-xs); padding: 0 2px; }
+  .date-nav button { padding: 6px 8px; background: none; border: none; cursor: pointer; color: var(--text-secondary); font-size: 16px; border-radius: 4px; transition: background 0.15s; }
+  .date-nav button:hover:not(:disabled) { background: var(--bg); }
+  .date-nav button:disabled { opacity: 0.25; cursor: not-allowed; }
+  .date-nav span { font-size: 13px; font-weight: 500; min-width: 110px; text-align: center; color: var(--text-primary); }
+  .refresh-btn { color: var(--text-tertiary); font-size: 16px; text-decoration: none; padding: 6px; border-radius: 50%; transition: all 0.2s; }
+  .refresh-btn:hover { background: var(--bg); color: var(--text-secondary); }
+
+  /* ── KPI Strip ── */
+  .kpi-strip { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1px; background: var(--border); border-radius: var(--radius-sm); overflow: hidden; margin-bottom: 12px; box-shadow: var(--shadow); }
+  .kpi-item { background: var(--surface); padding: 10px 14px; text-align: center; }
+  .kpi-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-tertiary); margin-bottom: 2px; }
+  .kpi-value { font-size: 17px; font-weight: 700; letter-spacing: -0.02em; }
+  .kpi-sub { font-size: 10px; color: var(--text-tertiary); margin-top: 1px; }
+
+  /* ── Alerts ── */
+  .alert { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: var(--radius-xs); font-size: 12px; font-weight: 500; margin-bottom: 4px; }
+  .alert-critical { background: var(--red-bg); color: var(--red); }
+  .alert-warning { background: var(--orange-bg); color: var(--orange); }
+  .alert-info { background: var(--blue-bg); color: var(--blue); }
+  .alert-icon { width: 18px; height: 18px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 800; flex-shrink: 0; }
+  .alert-critical .alert-icon { background: var(--red); color: white; }
+  .alert-warning .alert-icon { background: var(--orange); color: white; }
+  .alert-info .alert-icon { background: var(--blue); color: white; }
+
+  /* ── Tabs ── */
+  .tab-bar { display: flex; gap: 4px; padding-bottom: 12px; overflow-x: auto; }
+  .tab-btn { padding: 6px 16px; font-size: 13px; font-weight: 500; border: none; border-radius: 980px; cursor: pointer; transition: all 0.2s; background: transparent; color: var(--text-secondary); white-space: nowrap; }
+  .tab-btn:hover { background: rgba(0,0,0,0.04); }
+  .tab-btn.active { background: var(--text-primary); color: white; }
+
+  /* ── Cards ── */
+  .card { background: var(--surface); border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); transition: box-shadow 0.2s; }
+  .card:hover { box-shadow: var(--shadow-md); }
+  .card-sm { padding: 16px; border-radius: var(--radius-sm); }
+  .card-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-tertiary); }
+  .card-value { font-size: 28px; font-weight: 700; letter-spacing: -0.03em; margin-top: 4px; line-height: 1.1; }
+  .card-sub { font-size: 12px; color: var(--text-tertiary); margin-top: 4px; }
+  .metric-card { background: var(--surface); border-radius: var(--radius-sm); padding: 14px 16px; box-shadow: var(--shadow); }
+  .metric-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-tertiary); }
+  .metric-value { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; margin-top: 2px; }
+  .metric-sub { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
+
+  /* ── Section headers ── */
+  .section-title { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; color: var(--text-primary); margin-bottom: 16px; }
+  .section-subtitle { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+  /* ── Tables ── */
+  .table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .table th { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-tertiary); padding: 10px 12px; text-align: left; border-bottom: 0.5px solid var(--border-strong); }
+  .table th.right { text-align: right; }
+  .table td { padding: 10px 12px; border-bottom: 0.5px solid var(--border); color: var(--text-primary); }
+  .table td.right { text-align: right; }
+  .table td.muted { color: var(--text-tertiary); }
+  .table tr { transition: background 0.15s; }
+  .table tr:hover { background: var(--surface-hover); }
+  .table tr.clickable { cursor: pointer; }
+
+  /* ── Badges ── */
+  .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 980px; font-size: 11px; font-weight: 600; }
+  .badge-green { background: var(--green-bg); color: var(--green); }
+  .badge-red { background: var(--red-bg); color: var(--red); }
+  .badge-orange { background: var(--orange-bg); color: var(--orange); }
+  .badge-blue { background: var(--blue-bg); color: var(--blue); }
+  .badge-gray { background: rgba(0,0,0,0.05); color: var(--text-secondary); }
+
+  /* ── Progress bars ── */
+  .progress { height: 6px; background: rgba(0,0,0,0.05); border-radius: 3px; overflow: hidden; }
+  .progress-fill { height: 100%; border-radius: 3px; transition: width 0.6s cubic-bezier(0.16, 1, 0.3, 1); }
+
+  /* ── Score indicators ── */
+  .score-healthy { background: var(--green-bg); color: #1b8a36; }
+  .score-monitor { background: rgba(255,204,0,0.12); color: #946800; }
+  .score-attention { background: var(--orange-bg); color: #c25e00; }
+  .score-critical { background: var(--red-bg); color: #d12215; }
+
+  /* ── WoW ── */
+  .wow-up { color: var(--green); }
+  .wow-down { color: var(--red); }
+
+  /* ── Deal link cards ── */
+  .deal-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-radius: var(--radius-sm); transition: background 0.15s; text-decoration: none; color: inherit; }
+  .deal-row:hover { background: var(--bg); }
+
+  /* ── Grid layouts ── */
+  .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .grid-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+  .grid-6 { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+  .grid-2-1 { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+  .grid-1-1 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .gap-sm { gap: 8px; }
+  .gap-md { gap: 16px; }
+  .gap-lg { gap: 24px; }
+
+  /* ── Utility ── */
+  .hidden { display: none !important; }
+  .space-y > * + * { margin-top: 20px; }
+  .space-y-sm > * + * { margin-top: 12px; }
+  .mt-sm { margin-top: 8px; }
+  .mt-md { margin-top: 16px; }
+  .text-green { color: var(--green); }
+  .text-red { color: var(--red); }
+  .text-blue { color: var(--blue); }
+  .text-orange { color: var(--orange); }
+  .text-purple { color: var(--purple); }
+  .text-teal { color: var(--teal); }
+  .text-muted { color: var(--text-tertiary); }
+  .font-bold { font-weight: 700; }
+  .font-medium { font-weight: 500; }
+  .text-sm { font-size: 13px; }
+  .text-xs { font-size: 11px; }
+  .text-right { text-align: right; }
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .flex { display: flex; }
+  .flex-between { display: flex; justify-content: space-between; align-items: center; }
+  .flex-center { display: flex; align-items: center; }
+  .flex-1 { flex: 1; min-width: 0; }
+  .overflow-auto { overflow-x: auto; }
+
+  /* ── Charts ── */
+  canvas { border-radius: var(--radius-sm); }
+
+  /* ── Responsive ── */
+  @media (max-width: 768px) {
+    .kpi-strip { grid-template-columns: repeat(3, 1fr); }
+    .grid-4, .grid-5, .grid-6 { grid-template-columns: repeat(2, 1fr); }
+    .grid-2-1, .grid-1-1 { grid-template-columns: 1fr; }
+    .container { padding: 0 16px; }
+  }
+  @media (max-width: 480px) {
+    .grid-3, .grid-2 { grid-template-columns: 1fr; }
+    .kpi-strip { grid-template-columns: repeat(2, 1fr); }
+  }
   @media print { .no-print { display: none; } canvas { max-height: 300px; } }
-  @media (max-width: 640px) { .kpi-strip { grid-template-columns: repeat(3, 1fr) !important; } .kpi-strip > div:nth-child(n+4) { display: none; } }
+
+  /* ── Loading shimmer ── */
+  .health-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
 </style>
 </head>
-<body class="bg-gray-50 min-h-screen">
+<body>
 
-<!-- STICKY HEADER -->
-<header class="sticky top-0 z-50 bg-white border-b border-gray-200 px-4 py-2 shadow-sm">
-  <div class="max-w-6xl mx-auto">
-    <div class="flex flex-wrap justify-between items-center gap-2 mb-2">
-      <div class="min-w-0">
-        <h1 class="text-lg font-bold text-gray-900">Sammy AI <span class="text-xs font-normal text-gray-400">RevOps</span></h1>
-        <p class="text-xs text-gray-400" id="timestamp"></p>
-      </div>
-      <div class="flex items-center gap-3 no-print">
-        <select id="repSelect" class="text-sm border border-gray-200 rounded-lg px-3 py-1.5 bg-white focus:ring-2 focus:ring-blue-500" onchange="setRep(this.value)">
-          <option value="">All Reps</option>
-        </select>
-        <div id="dateNav" class="flex items-center gap-1 bg-white border border-gray-200 rounded-lg px-1">
-          <button id="btnDatePrev" class="p-1.5 text-gray-500 hover:text-blue-500 disabled:opacity-30 disabled:cursor-not-allowed" onclick="navigateDate(-1)">&lsaquo;</button>
-          <span id="dateDisplay" class="text-sm font-medium text-gray-700 px-2 min-w-[110px] text-center"></span>
-          <button id="btnDateNext" class="p-1.5 text-gray-500 hover:text-blue-500 disabled:opacity-30 disabled:cursor-not-allowed" onclick="navigateDate(1)">&rsaquo;</button>
+<!-- HEADER -->
+<header class="header">
+  <div class="container">
+    <div class="header-inner">
+      <div class="header-top">
+        <div>
+          <div class="brand">Sammy<span>RevOps</span></div>
+          <div class="timestamp" id="timestamp"></div>
         </div>
-        <a href="/refresh" class="text-xs text-gray-400 hover:text-blue-500" title="Force refresh">&#x21bb;</a>
+        <div class="controls no-print">
+          <select id="repSelect" onchange="setRep(this.value)">
+            <option value="">All Reps</option>
+          </select>
+          <div class="date-nav" id="dateNav">
+            <button id="btnDatePrev" onclick="navigateDate(-1)">&lsaquo;</button>
+            <span id="dateDisplay"></span>
+            <button id="btnDateNext" onclick="navigateDate(1)">&rsaquo;</button>
+          </div>
+          <a href="/refresh" class="refresh-btn" title="Refresh">&#x21bb;</a>
+        </div>
       </div>
+
+      <div class="kpi-strip" id="execSummary"></div>
+      <div id="alertsBanner"></div>
+
+      <nav class="tab-bar no-print">
+        <button id="btnToday" class="tab-btn" onclick="switchTab('today')">Today</button>
+        <button id="btnPipeline" class="tab-btn" onclick="switchTab('pipeline')">Pipeline</button>
+        <button id="btnChannels" class="tab-btn" onclick="switchTab('channels')">Channels</button>
+        <button id="btnRevops" class="tab-btn" onclick="switchTab('revops')">RevOps</button>
+      </nav>
     </div>
-
-    <!-- EXECUTIVE SUMMARY KPI STRIP -->
-    <div id="execSummary" class="grid grid-cols-6 gap-2 mb-2 kpi-strip"></div>
-    <!-- ALERTS BANNER -->
-    <div id="alertsBanner" class="mb-2"></div>
-
-    <!-- TAB BAR -->
-    <nav class="flex gap-1 overflow-x-auto no-print pb-1">
-      <button id="btnToday" class="tab-btn px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap" onclick="switchTab('today')">Today</button>
-      <button id="btnPipeline" class="tab-btn px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap" onclick="switchTab('pipeline')">Pipeline</button>
-      <button id="btnChannels" class="tab-btn px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap" onclick="switchTab('channels')">Channels</button>
-      <button id="btnRevops" class="tab-btn px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap" onclick="switchTab('revops')">RevOps</button>
-    </nav>
   </div>
 </header>
 
-<main class="max-w-6xl mx-auto px-4 py-6">
+<main class="container" style="padding-top:24px;padding-bottom:48px;">
 
-  <!-- TAB 1: TODAY (includes rep comparison from old Reps tab) -->
-  <div id="tabToday" class="space-y-6">
+  <!-- TODAY -->
+  <div id="tabToday" class="space-y">
     <div id="scorecardSection"></div>
     <div id="drilldownSection" class="hidden"></div>
     <div id="myDaySection"></div>
@@ -1393,47 +1538,27 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
     <div id="repComparisonSection"></div>
   </div>
 
-  <!-- TAB 2: PIPELINE -->
-  <div id="tabPipeline" class="space-y-6 hidden">
-    <div class="grid grid-cols-2 md:grid-cols-5 gap-3" id="pipelineKPIs"></div>
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-      <div class="lg:col-span-2 bg-white rounded-xl border border-gray-100 p-4">
-        <canvas id="pipelineChart" height="260"></canvas>
-      </div>
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">Stage Conversion</h3>
-        <div id="stageConversionSection"></div>
-      </div>
+  <!-- PIPELINE -->
+  <div id="tabPipeline" class="space-y hidden">
+    <div class="grid-5" id="pipelineKPIs"></div>
+    <div class="grid-2-1 gap-md">
+      <div class="card"><canvas id="pipelineChart" height="260"></canvas></div>
+      <div class="card"><p class="section-subtitle">Stage Conversion</p><div id="stageConversionSection"></div></div>
     </div>
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">Touch Velocity by Stage</h3>
-        <canvas id="touchVelocityChart" height="200"></canvas>
-      </div>
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">Deal Health Scores</h3>
-        <div id="dealHealthScoresSection"></div>
-      </div>
+    <div class="grid-1-1 gap-md">
+      <div class="card"><p class="section-subtitle">Touch Velocity</p><canvas id="touchVelocityChart" height="200"></canvas></div>
+      <div class="card"><p class="section-subtitle">Deal Health Scores</p><div id="dealHealthScoresSection"></div></div>
     </div>
-    <div class="bg-white rounded-xl border border-gray-100 p-4">
-      <h3 class="text-sm font-medium text-gray-500 mb-3">Stale Deal Triage</h3>
-      <div id="staleDealTriageSection"></div>
-    </div>
+    <div class="card"><p class="section-subtitle">Stale Deal Triage</p><div id="staleDealTriageSection"></div></div>
   </div>
 
-  <!-- TAB 3: CHANNELS -->
-  <div id="tabChannels" class="space-y-6 hidden">
+  <!-- CHANNELS -->
+  <div id="tabChannels" class="space-y hidden">
     <div id="dataQualityBanner"></div>
     <div id="sourceAttributionSection"></div>
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">Deals by Source</h3>
-        <canvas id="sourceChart" height="220"></canvas>
-      </div>
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">Avg Deal Cycle by Source</h3>
-        <canvas id="sourceCycleChart" height="220"></canvas>
-      </div>
+    <div class="grid-1-1 gap-md">
+      <div class="card"><p class="section-subtitle">Deals by Source</p><canvas id="sourceChart" height="220"></canvas></div>
+      <div class="card"><p class="section-subtitle">Avg Cycle by Source</p><canvas id="sourceCycleChart" height="220"></canvas></div>
     </div>
     <div id="ebFunnelSection"></div>
     <div id="ebCampaignSection"></div>
@@ -1441,66 +1566,35 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
     <div id="channelMixSection"></div>
   </div>
 
-  <!-- TAB 4: REVOPS (was Revenue) -->
-  <div id="tabRevops" class="space-y-6 hidden">
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-3" id="unitEconCards"></div>
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">MRR Movement (30d)</h3>
-        <canvas id="mrrWaterfallChart" height="200"></canvas>
-      </div>
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">Week-over-Week</h3>
-        <div id="wowSection"></div>
-      </div>
+  <!-- REVOPS -->
+  <div id="tabRevops" class="space-y hidden">
+    <div class="grid-4" id="unitEconCards"></div>
+    <div class="grid-1-1 gap-md">
+      <div class="card"><p class="section-subtitle">MRR Movement (30d)</p><canvas id="mrrWaterfallChart" height="200"></canvas></div>
+      <div class="card"><p class="section-subtitle">Week-over-Week</p><div id="wowSection"></div></div>
     </div>
-    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3" id="pnlCards"></div>
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">Cost Breakdown</h3>
-        <table class="w-full text-sm" id="costTable"></table>
-      </div>
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">MRR by Tier</h3>
-        <div class="flex items-center gap-6">
-          <canvas id="mrrChart" class="max-h-40"></canvas>
-          <div id="mrrLegend" class="text-sm space-y-2"></div>
-        </div>
-      </div>
+    <div class="grid-6" id="pnlCards"></div>
+    <div class="grid-1-1 gap-md">
+      <div class="card"><p class="section-subtitle">Cost Breakdown</p><table class="table" id="costTable"></table></div>
+      <div class="card"><p class="section-subtitle">MRR by Tier</p><div class="flex-center" style="gap:24px"><canvas id="mrrChart" style="max-height:160px"></canvas><div id="mrrLegend" class="space-y-sm"></div></div></div>
     </div>
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">Conversion Funnel</h3>
-        <canvas id="funnelChart" height="200"></canvas>
-      </div>
-      <div class="bg-white rounded-xl border border-gray-100 p-4">
-        <h3 class="text-sm font-medium text-gray-500 mb-3">Engagement Score Distribution</h3>
-        <div class="flex items-center gap-6">
-          <canvas id="engScoreChart" class="max-h-40"></canvas>
-          <div id="engScoreLegend" class="text-sm space-y-2"></div>
-        </div>
-      </div>
+    <div class="grid-1-1 gap-md">
+      <div class="card"><p class="section-subtitle">Conversion Funnel</p><canvas id="funnelChart" height="200"></canvas></div>
+      <div class="card"><p class="section-subtitle">Engagement Distribution</p><div class="flex-center" style="gap:24px"><canvas id="engScoreChart" style="max-height:160px"></canvas><div id="engScoreLegend" class="space-y-sm"></div></div></div>
     </div>
-    <div class="grid grid-cols-2 md:grid-cols-3 gap-3" id="funnelKPIs"></div>
+    <div class="grid-3" id="funnelKPIs"></div>
     <div id="forecastSection"></div>
-    <section>
-      <h2 class="text-base font-semibold text-gray-800 mb-4">Deal Velocity</h2>
-      <div class="grid grid-cols-2 md:grid-cols-3 gap-3 mb-4" id="velocityKPIs"></div>
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div class="bg-white rounded-xl border border-gray-100 p-4">
-          <canvas id="velocityChart" height="220"></canvas>
-        </div>
-        <div class="bg-white rounded-xl border border-gray-100 p-4 overflow-y-auto max-h-96">
-          <h3 class="text-sm font-medium text-gray-500 mb-3">Stale Deals (&gt;30 days)</h3>
-          <table class="w-full text-sm" id="staleTable"></table>
-        </div>
+    <div>
+      <p class="section-title">Deal Velocity</p>
+      <div class="grid-3 mt-sm" id="velocityKPIs"></div>
+      <div class="grid-1-1 gap-md mt-md">
+        <div class="card"><canvas id="velocityChart" height="220"></canvas></div>
+        <div class="card" style="max-height:400px;overflow-y:auto"><p class="section-subtitle">Stale Deals (&gt;30d)</p><table class="table" id="staleTable"></table></div>
       </div>
-    </section>
+    </div>
   </div>
 
 </main>
-
-<footer class="text-center text-xs text-gray-400 py-6 no-print">Auto-refreshes every 5 min</footer>
 
 <script>
 const D = ${json};
@@ -1512,20 +1606,20 @@ const PORTAL = D.portalId;
 const $ = id => document.getElementById(id);
 const fmt = n => n == null ? 'N/A' : '$' + Math.abs(n).toLocaleString();
 const pct = n => n == null ? 'N/A' : n + '%';
-const BLUE = '#3b82f6', GREEN = '#22c55e', RED = '#ef4444', AMBER = '#f59e0b', PURPLE = '#8b5cf6', CYAN = '#06b6d4', GRAY = '#9ca3af', LGRAY = '#e5e7eb';
+const BLUE = '#007aff', GREEN = '#34c759', RED = '#ff3b30', AMBER = '#ff9500', PURPLE = '#af52de', CYAN = '#5ac8fa', GRAY = '#8e8e93', LGRAY = '#e5e5ea';
 
 function card(label, value, color, sub) {
-  return '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-    + '<p class="text-xs font-medium text-gray-500 uppercase tracking-wide">' + label + '</p>'
-    + '<p class="text-xl font-bold mt-1" style="color:' + color + '">' + value + '</p>'
-    + (sub ? '<p class="text-xs text-gray-400 mt-1">' + sub + '</p>' : '') + '</div>';
+  return '<div class="metric-card">'
+    + '<p class="metric-label">' + label + '</p>'
+    + '<p class="metric-value" style="color:' + color + '">' + value + '</p>'
+    + (sub ? '<p class="metric-sub">' + sub + '</p>' : '') + '</div>';
 }
 
 function miniCard(label, value, color, sub) {
-  return '<div class="text-center px-2 py-1.5">'
-    + '<p class="text-[10px] text-gray-400 uppercase tracking-wider">' + label + '</p>'
-    + '<p class="text-sm font-bold" style="color:' + color + '">' + value + '</p>'
-    + (sub ? '<p class="text-[10px] text-gray-400">' + sub + '</p>' : '') + '</div>';
+  return '<div class="kpi-item">'
+    + '<p class="kpi-label">' + label + '</p>'
+    + '<p class="kpi-value" style="color:' + color + '">' + value + '</p>'
+    + (sub ? '<p class="kpi-sub">' + sub + '</p>' : '') + '</div>';
 }
 
 // ═══ STATE ═══
@@ -1606,22 +1700,20 @@ function renderExecSummary() {
 
   // Alerts banner
   if (es.alerts && es.alerts.length > 0) {
-    let alertHTML = '<div class="space-y-1">';
+    let alertHTML = '';
     for (const a of es.alerts.slice(0, 3)) {
-      const cls = a.severity === 'critical' ? 'alert-critical' : (a.severity === 'warning' ? 'alert-warning' : 'alert-info');
-      alertHTML += '<div class="' + cls + ' border rounded-lg px-3 py-1.5 text-xs font-medium flex items-center gap-2">'
-        + '<span class="font-bold">' + (a.severity === 'critical' ? '!!!' : a.severity === 'warning' ? '!!' : 'i') + '</span>'
+      const cls = 'alert alert-' + a.severity;
+      alertHTML += '<div class="' + cls + '">'
+        + '<span class="alert-icon">' + (a.severity === 'critical' ? '!' : a.severity === 'warning' ? '!' : 'i') + '</span>'
         + '<span>' + a.message + '</span></div>';
     }
-    alertHTML += '</div>';
     $('alertsBanner').innerHTML = alertHTML;
   } else {
     $('alertsBanner').innerHTML = '';
   }
 
-  // Data freshness warning
   if (D.dataFreshness && D.dataFreshness.isStale) {
-    $('alertsBanner').innerHTML += '<div class="alert-warning border rounded-lg px-3 py-1.5 text-xs font-medium mt-1">Data is ' + D.dataFreshness.cacheAgeMinutes + ' minutes old</div>';
+    $('alertsBanner').innerHTML += '<div class="alert alert-warning"><span class="alert-icon">!</span>Data is ' + D.dataFreshness.cacheAgeMinutes + ' minutes old</div>';
   }
 }
 renderExecSummary();
@@ -1676,47 +1768,46 @@ function renderToday() {
   const kpi = selectedRepName ? (dayData.kpis?.[selectedRepName] || null) : null;
 
   if (kpi) {
-    function kpiBar(label, current, target, prefix, suffix, color) {
+    function kpiBar(label, current, target, prefix, suffix) {
       const pct = target > 0 ? Math.min(Math.round((current / target) * 100), 100) : 0;
       const barCol = pct >= 100 ? GREEN : (pct >= 50 ? AMBER : RED);
-      return '<div class="mb-4">'
-        + '<div class="flex justify-between items-baseline mb-1">'
-        + '<span class="text-sm font-medium text-gray-700">' + label + '</span>'
+      return '<div style="margin-bottom:16px">'
+        + '<div class="flex-between" style="margin-bottom:6px">'
+        + '<span class="text-sm font-medium">' + label + '</span>'
         + '<span class="text-sm font-bold" style="color:' + barCol + '">' + prefix + current + suffix + ' / ' + prefix + target + suffix + '</span></div>'
-        + '<div class="w-full bg-gray-100 rounded-full h-3 overflow-hidden">'
-        + '<div class="h-3 rounded-full transition-all duration-500" style="width:' + pct + '%;background:' + barCol + '"></div></div></div>';
+        + '<div class="progress"><div class="progress-fill" style="width:' + pct + '%;background:' + barCol + '"></div></div></div>';
     }
     const overallPct = Math.round(((kpi.uniqueCalls / kpi.targets.uniqueCalls) + (kpi.callHours / kpi.targets.callHours) + (kpi.dailyRevenue / kpi.targets.dailyRevenue)) / 3 * 100);
     const overallColor = overallPct >= 100 ? GREEN : (overallPct >= 50 ? AMBER : RED);
-    const overallText = overallPct >= 100 ? 'Targets hit!' : (overallPct >= 50 ? 'Getting there' : (overallPct === 0 ? 'Not started' : 'Behind'));
+    const overallText = overallPct >= 100 ? 'Targets hit' : (overallPct >= 50 ? 'Getting there' : (overallPct === 0 ? 'Not started' : 'Behind'));
 
-    $('myDaySection').innerHTML = '<div class="bg-white rounded-xl border border-gray-100 p-5 shadow-sm">'
-      + '<div class="flex justify-between items-start mb-5">'
-      + '<div><h2 class="text-base font-semibold text-gray-800">' + selectedRepName.split(' ')[0] + "'s " + (isToday ? "Day" : dateLabel) + '</h2>'
-      + '<p class="text-xs text-gray-400 mt-0.5">Daily KPI targets</p></div>'
-      + '<span class="text-sm font-medium px-2.5 py-1 rounded-full" style="background:' + overallColor + '18;color:' + overallColor + '">' + overallText + '</span></div>'
-      + kpiBar('Unique Dials', kpi.uniqueCalls, kpi.targets.uniqueCalls, '', '', BLUE)
-      + kpiBar('Call Time', kpi.callHours, kpi.targets.callHours, '', 'h', PURPLE)
-      + kpiBar('Revenue', kpi.dailyRevenue, kpi.targets.dailyRevenue, '$', '', GREEN)
-      + '<div class="mt-4 pt-3 border-t border-gray-100">'
-      + '<p class="text-sm text-gray-600 font-medium">' + kpi.uniqueCalls + ' dials | ' + kpi.callHours + 'h talk | ' + todayData.meetings + ' meetings | ' + todayData.notes + ' notes | $' + kpi.dailyRevenue + ' closed</p>'
+    $('myDaySection').innerHTML = '<div class="card">'
+      + '<div class="flex-between" style="margin-bottom:20px">'
+      + '<div><p class="section-title" style="margin-bottom:2px">' + selectedRepName.split(' ')[0] + "'s " + (isToday ? "Day" : dateLabel) + '</p>'
+      + '<p class="text-xs text-muted">Daily KPI targets</p></div>'
+      + '<span class="badge" style="background:' + overallColor + '14;color:' + overallColor + '">' + overallText + '</span></div>'
+      + kpiBar('Unique Dials', kpi.uniqueCalls, kpi.targets.uniqueCalls, '', '')
+      + kpiBar('Call Time', kpi.callHours, kpi.targets.callHours, '', 'h')
+      + kpiBar('Revenue', kpi.dailyRevenue, kpi.targets.dailyRevenue, '$', '')
+      + '<div style="margin-top:16px;padding-top:12px;border-top:0.5px solid var(--border)">'
+      + '<p class="text-sm text-muted font-medium">' + kpi.uniqueCalls + ' dials  ·  ' + kpi.callHours + 'h talk  ·  ' + todayData.meetings + ' meetings  ·  ' + todayData.notes + ' notes  ·  $' + kpi.dailyRevenue + ' closed</p>'
       + '</div></div>';
   } else {
     const pctDone = avgTotal > 0 ? Math.min(Math.round((todayTotal / avgTotal) * 100), 100) : (todayTotal > 0 ? 100 : 0);
     const barColor = pctDone >= 100 ? GREEN : (pctDone >= 50 ? AMBER : RED);
     const statusText = pctDone >= 100 ? 'On pace' : (pctDone >= 50 ? 'Getting there' : (todayTotal === 0 ? 'Not started' : 'Behind'));
 
-    $('myDaySection').innerHTML = '<div class="bg-white rounded-xl border border-gray-100 p-5 shadow-sm">'
-      + '<div class="flex justify-between items-start mb-4">'
-      + '<div><h2 class="text-base font-semibold text-gray-800">' + (selectedRepName ? selectedRepName.split(' ')[0] + "'s " + (isToday ? "Day" : dateLabel) : (isToday ? "Team Today" : "Team " + dateLabel)) + '</h2>'
-      + '<p class="text-xs text-gray-400 mt-0.5">Activity vs 30-day average</p></div>'
-      + '<span class="text-sm font-medium px-2.5 py-1 rounded-full" style="background:' + barColor + '18;color:' + barColor + '">' + statusText + '</span></div>'
-      + '<div class="w-full bg-gray-100 rounded-full h-4 mb-4 overflow-hidden"><div class="progress-bar h-4 rounded-full" style="width:' + pctDone + '%;background:' + barColor + '"></div></div>'
-      + '<p class="text-sm text-gray-500 mb-5">' + todayTotal + ' of ' + avgTotal + ' daily avg (' + pctDone + '%)</p>'
-      + '<div class="grid grid-cols-3 gap-4 text-center">'
-      + '<div><p class="text-3xl font-bold" style="color:' + BLUE + '">' + todayData.calls + '</p><p class="text-xs text-gray-500 mt-1">Calls</p><p class="text-xs text-gray-400">avg ' + avgData.calls + '/day</p></div>'
-      + '<div><p class="text-3xl font-bold" style="color:' + GREEN + '">' + todayData.meetings + '</p><p class="text-xs text-gray-500 mt-1">Meetings</p><p class="text-xs text-gray-400">avg ' + avgData.meetings + '/day</p></div>'
-      + '<div><p class="text-3xl font-bold" style="color:' + PURPLE + '">' + todayData.notes + '</p><p class="text-xs text-gray-500 mt-1">Notes</p><p class="text-xs text-gray-400">avg ' + avgData.notes + '/day</p></div>'
+    $('myDaySection').innerHTML = '<div class="card">'
+      + '<div class="flex-between" style="margin-bottom:16px">'
+      + '<div><p class="section-title" style="margin-bottom:2px">' + (selectedRepName ? selectedRepName.split(' ')[0] + "'s " + (isToday ? "Day" : dateLabel) : (isToday ? "Team Today" : "Team " + dateLabel)) + '</p>'
+      + '<p class="text-xs text-muted">Activity vs 30-day average</p></div>'
+      + '<span class="badge" style="background:' + barColor + '14;color:' + barColor + '">' + statusText + '</span></div>'
+      + '<div class="progress" style="margin-bottom:16px"><div class="progress-fill" style="width:' + pctDone + '%;background:' + barColor + '"></div></div>'
+      + '<p class="text-sm text-muted" style="margin-bottom:20px">' + todayTotal + ' of ' + avgTotal + ' daily avg (' + pctDone + '%)</p>'
+      + '<div class="grid-3" style="text-align:center">'
+      + '<div><p style="font-size:32px;font-weight:700;letter-spacing:-0.03em;color:' + BLUE + '">' + todayData.calls + '</p><p class="text-xs text-muted" style="margin-top:4px">Calls</p><p class="text-xs text-muted">avg ' + avgData.calls + '/day</p></div>'
+      + '<div><p style="font-size:32px;font-weight:700;letter-spacing:-0.03em;color:' + GREEN + '">' + todayData.meetings + '</p><p class="text-xs text-muted" style="margin-top:4px">Meetings</p><p class="text-xs text-muted">avg ' + avgData.meetings + '/day</p></div>'
+      + '<div><p style="font-size:32px;font-weight:700;letter-spacing:-0.03em;color:' + PURPLE + '">' + todayData.notes + '</p><p class="text-xs text-muted" style="margin-top:4px">Notes</p><p class="text-xs text-muted">avg ' + avgData.notes + '/day</p></div>'
       + '</div></div>';
   }
 
@@ -1790,21 +1881,21 @@ function renderToday() {
   if (!selectedRepName) {
     const activeReps = D.reps.filter(r => D.activeReps.includes(r.name));
     if (activeReps.length > 0) {
-      let rcHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4"><h2 class="text-base font-semibold text-gray-800 mb-3">Rep Comparison</h2>'
-        + '<div class="overflow-x-auto"><table class="w-full text-sm">'
-        + '<thead><tr class="border-b text-xs text-gray-500 uppercase tracking-wide">'
-        + '<th class="text-left py-2">Rep</th><th class="text-right py-2">Deals</th><th class="text-right py-2">Won</th><th class="text-right py-2">Lost</th><th class="text-right py-2">Win%</th><th class="text-right py-2">MRR</th><th class="text-right py-2">Cycle</th><th class="text-right py-2">$/Activity</th>'
+      let rcHTML = '<div class="card" style="padding:0;overflow:hidden"><div style="padding:20px 20px 12px"><p class="section-subtitle">Rep Comparison</p></div>'
+        + '<div class="overflow-auto"><table class="table">'
+        + '<thead><tr>'
+        + '<th>Rep</th><th class="right">Deals</th><th class="right">Won</th><th class="right">Lost</th><th class="right">Win%</th><th class="right">MRR</th><th class="right">Cycle</th><th class="right">$/Activity</th>'
         + '</tr></thead><tbody>';
       for (const r of activeReps) {
-        rcHTML += '<tr class="border-b border-gray-50">'
-          + '<td class="py-2 font-medium">' + r.name + '</td>'
-          + '<td class="text-right py-2">' + r.total + '</td>'
-          + '<td class="text-right py-2 text-green-600 font-medium">' + r.won + '</td>'
-          + '<td class="text-right py-2 text-red-500">' + r.lost + '</td>'
-          + '<td class="text-right py-2">' + r.winRate + '%</td>'
-          + '<td class="text-right py-2 font-bold text-green-600">$' + r.wonMRR.toLocaleString() + '</td>'
-          + '<td class="text-right py-2">' + (r.avgCycleDays != null ? r.avgCycleDays + 'd' : '-') + '</td>'
-          + '<td class="text-right py-2 font-medium">$' + (r.efficiency || 0).toFixed(1) + '</td></tr>';
+        rcHTML += '<tr>'
+          + '<td class="font-medium">' + r.name + '</td>'
+          + '<td class="right">' + r.total + '</td>'
+          + '<td class="right text-green font-bold">' + r.won + '</td>'
+          + '<td class="right text-red">' + r.lost + '</td>'
+          + '<td class="right">' + r.winRate + '%</td>'
+          + '<td class="right font-bold text-green">$' + r.wonMRR.toLocaleString() + '</td>'
+          + '<td class="right muted">' + (r.avgCycleDays != null ? r.avgCycleDays + 'd' : '-') + '</td>'
+          + '<td class="right font-medium">$' + (r.efficiency || 0).toFixed(1) + '</td></tr>';
       }
       rcHTML += '</tbody></table></div></div>';
       $('repComparisonSection').innerHTML = rcHTML;
@@ -1818,20 +1909,20 @@ function renderScorecard() {
   const repsWithTargets = D.activeReps.filter(n => D.weeklyRollup[n]);
   let behindCount = 0;
 
-  let html = '<div class="flex justify-between items-center mb-4">'
-    + '<h2 class="text-base font-semibold text-gray-800">Daily Scorecard \\u2014 ' + formatDateDisplay(selectedDate) + '</h2>'
-    + '<span id="behindBadge" class="text-xs font-medium px-2 py-1 rounded-full"></span></div>';
+  let html = '<div class="flex-between" style="margin-bottom:16px">'
+    + '<p class="section-title" style="margin-bottom:0">Daily Scorecard \\u2014 ' + formatDateDisplay(selectedDate) + '</p>'
+    + '<span id="behindBadge" class="badge"></span></div>';
 
-  html += '<div class="bg-white rounded-xl border border-gray-100 overflow-x-auto">'
-    + '<table class="w-full text-sm"><thead><tr class="border-b text-xs text-gray-500 uppercase tracking-wide">'
-    + '<th class="text-left py-3 px-4">Rep</th>'
-    + '<th class="text-right py-3 px-2">Dials</th>'
-    + '<th class="text-right py-3 px-2">Unique</th>'
-    + '<th class="text-right py-3 px-2">Hours</th>'
-    + '<th class="text-right py-3 px-2">Mtgs</th>'
-    + '<th class="text-right py-3 px-2">Notes</th>'
-    + '<th class="text-right py-3 px-2">Revenue</th>'
-    + '<th class="text-right py-3 px-4">Score</th>'
+  html += '<div class="card" style="padding:0;overflow:hidden"><div class="overflow-auto">'
+    + '<table class="table"><thead><tr>'
+    + '<th>Rep</th>'
+    + '<th class="right">Dials</th>'
+    + '<th class="right">Unique</th>'
+    + '<th class="right">Hours</th>'
+    + '<th class="right">Mtgs</th>'
+    + '<th class="right">Notes</th>'
+    + '<th class="right">Revenue</th>'
+    + '<th class="right">Score</th>'
     + '</tr></thead><tbody>';
 
   for (const repName of repsWithTargets) {
@@ -1845,28 +1936,29 @@ function renderScorecard() {
     const isBehind = score < 50;
     if (isBehind) behindCount++;
 
-    function cellColor(pct) { return pct >= 100 ? 'text-green-600 font-bold' : (pct >= 50 ? 'text-amber-600' : 'text-red-600 font-bold'); }
-    const scoreColor = score >= 100 ? 'bg-green-50 text-green-700' : (score >= 50 ? 'bg-amber-50 text-amber-700' : 'bg-red-50 text-red-700');
-    const borderClass = isBehind ? 'border-l-4 border-l-red-400' : '';
+    function cellColor(pct) { return pct >= 100 ? 'text-green font-bold' : (pct >= 50 ? 'text-orange' : 'text-red font-bold'); }
+    const scoreClass = score >= 100 ? 'badge-green' : (score >= 50 ? 'badge-orange' : 'badge-red');
+    const borderStyle = isBehind ? 'border-left:3px solid var(--red)' : '';
     const isActive = drillDownRep === repName;
+    const bgStyle = isActive ? 'background:var(--blue-bg)' : '';
 
-    html += '<tr class="border-b border-gray-50 hover:bg-gray-50 cursor-pointer ' + borderClass + (isActive ? ' bg-blue-50' : '') + '" onclick="toggleDrillDown(\\'' + repName.replace("'", "\\\\'") + '\\')">'
-      + '<td class="py-3 px-4 font-medium">' + repName + '</td>'
-      + '<td class="text-right py-3 px-2">' + rd.calls + '</td>'
-      + '<td class="text-right py-3 px-2 ' + cellColor(dialPct) + '">' + kd.uniqueCalls + '</td>'
-      + '<td class="text-right py-3 px-2 ' + cellColor(hoursPct) + '">' + kd.callHours + 'h</td>'
-      + '<td class="text-right py-3 px-2">' + rd.meetings + '</td>'
-      + '<td class="text-right py-3 px-2">' + rd.notes + '</td>'
-      + '<td class="text-right py-3 px-2 ' + cellColor(revPct) + '">$' + kd.dailyRevenue + '</td>'
-      + '<td class="text-right py-3 px-4"><span class="text-xs font-bold px-2 py-1 rounded-full ' + scoreColor + '">' + score + '%</span></td>'
+    html += '<tr class="clickable" style="' + borderStyle + ';' + bgStyle + '" onclick="toggleDrillDown(\\'' + repName.replace("'", "\\\\'") + '\\')">'
+      + '<td class="font-medium">' + repName + '</td>'
+      + '<td class="right">' + rd.calls + '</td>'
+      + '<td class="right ' + cellColor(dialPct) + '">' + kd.uniqueCalls + '</td>'
+      + '<td class="right ' + cellColor(hoursPct) + '">' + kd.callHours + 'h</td>'
+      + '<td class="right">' + rd.meetings + '</td>'
+      + '<td class="right">' + rd.notes + '</td>'
+      + '<td class="right ' + cellColor(revPct) + '">$' + kd.dailyRevenue + '</td>'
+      + '<td class="right"><span class="badge ' + scoreClass + '">' + score + '%</span></td>'
       + '</tr>';
   }
-  html += '</tbody></table></div>';
+  html += '</tbody></table></div></div>';
 
   $('scorecardSection').innerHTML = html;
   const badge = $('behindBadge');
-  if (behindCount > 0) { badge.className = 'text-xs font-medium px-2 py-1 rounded-full bg-red-50 text-red-600'; badge.textContent = behindCount + ' rep' + (behindCount > 1 ? 's' : '') + ' behind'; }
-  else { badge.className = 'text-xs font-medium px-2 py-1 rounded-full bg-green-50 text-green-600'; badge.textContent = 'All on track'; }
+  if (behindCount > 0) { badge.className = 'badge badge-red'; badge.textContent = behindCount + ' rep' + (behindCount > 1 ? 's' : '') + ' behind'; }
+  else { badge.className = 'badge badge-green'; badge.textContent = 'All on track'; }
 }
 
 function toggleDrillDown(repName) {
@@ -1877,20 +1969,20 @@ function toggleDrillDown(repName) {
   const wr = D.weeklyRollup[repName]; const rep = D.reps.find(r => r.name === repName);
   const a = D.eb?.attribution?.byRep?.[repName]; const ceDeals = D.eb?.repCEDeals?.[repName] || [];
 
-  let html = '<div class="bg-white rounded-xl border border-blue-200 p-5 shadow-sm">'
-    + '<div class="flex justify-between items-start mb-4">'
-    + '<h2 class="text-base font-semibold text-gray-800">' + repName + ' \\u2014 7-Day Drill-Down</h2>'
-    + '<button onclick="toggleDrillDown(\\'' + repName.replace("'", "\\\\'") + '\\')" class="text-xs text-gray-400 hover:text-gray-600">Close</button></div>';
+  let html = '<div class="card" style="border:1.5px solid var(--blue);box-shadow:var(--shadow-lg)">'
+    + '<div class="flex-between" style="margin-bottom:16px">'
+    + '<p class="section-title" style="margin-bottom:0">' + repName + ' \\u2014 7-Day Drill-Down</p>'
+    + '<button onclick="toggleDrillDown(\\'' + repName.replace("'", "\\\\'") + '\\')" class="text-xs text-muted" style="background:none;border:none;cursor:pointer">Close</button></div>';
   if (wr && wr.days.length > 0) {
-    html += '<div class="overflow-x-auto mb-4"><table class="w-full text-xs">'
-      + '<thead><tr class="border-b text-gray-500 uppercase"><th class="text-left py-2 px-2">Day</th><th class="text-right py-2 px-2">Dials</th><th class="text-right py-2 px-2">Hours</th><th class="text-right py-2 px-2">Mtgs</th><th class="text-right py-2 px-2">Revenue</th></tr></thead><tbody>';
+    html += '<div class="overflow-auto" style="margin-bottom:16px"><table class="table">'
+      + '<thead><tr><th>Day</th><th class="right">Dials</th><th class="right">Hours</th><th class="right">Mtgs</th><th class="right">Revenue</th></tr></thead><tbody>';
     for (const d of wr.days) {
       const dayLabel = new Date(d.date + 'T12:00:00').toLocaleDateString('en-AU', { weekday: 'short', day: 'numeric', month: 'short' });
-      html += '<tr class="border-b border-gray-50"><td class="py-1.5 px-2">' + dayLabel + '</td><td class="text-right py-1.5 px-2 font-medium">' + d.uniqueCalls + '</td><td class="text-right py-1.5 px-2">' + d.callHours + 'h</td><td class="text-right py-1.5 px-2">' + d.meetings + '</td><td class="text-right py-1.5 px-2 font-medium">$' + d.dailyRevenue + '</td></tr>';
+      html += '<tr><td>' + dayLabel + '</td><td class="right font-bold">' + d.uniqueCalls + '</td><td class="right">' + d.callHours + 'h</td><td class="right">' + d.meetings + '</td><td class="right font-bold">$' + d.dailyRevenue + '</td></tr>';
     }
-    html += '<tr class="font-bold border-t"><td class="py-1.5 px-2">Total</td><td class="text-right py-1.5 px-2">' + wr.totDials + '</td><td class="text-right py-1.5 px-2">' + wr.totHours + 'h</td><td class="text-right py-1.5 px-2">' + wr.totMeetings + '</td><td class="text-right py-1.5 px-2">$' + wr.totRevenue + '</td></tr></tbody></table></div>';
+    html += '<tr style="font-weight:700;border-top:1px solid var(--border-strong)"><td>Total</td><td class="right">' + wr.totDials + '</td><td class="right">' + wr.totHours + 'h</td><td class="right">' + wr.totMeetings + '</td><td class="right">$' + wr.totRevenue + '</td></tr></tbody></table></div>';
   }
-  html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-3">';
+  html += '<div class="grid-4">';
   if (rep) { html += card('Open Deals', rep.open, BLUE, rep.total + ' total') + card('Won MRR', fmt(rep.wonMRR), GREEN, rep.won + ' deals') + card('Win Rate', pct(rep.winRate), rep.winRate >= 30 ? GREEN : AMBER, ''); }
   if (a && a.total > 0) { html += card('CE Deals', a.total, CYAN, fmt(a.wonMRR) + ' won MRR'); }
   html += '</div>';
@@ -2253,14 +2345,17 @@ setTimeout(() => window.location.reload(), 300000);
 }
 
 function loadingHTML() {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Loading...</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Sammy AI</title>
 <meta http-equiv="refresh" content="5">
-<script src="https://cdn.tailwindcss.com"><\/script></head>
-<body class="bg-gray-50 min-h-screen flex items-center justify-center">
-<div class="text-center"><div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto"></div>
-<p class="mt-4 text-gray-600 text-lg">Loading dashboard...</p>
-<p class="mt-2 text-gray-400 text-sm">Pulling live data from HubSpot + EmailBison</p>
-</div></body></html>`;
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif; background: #f5f5f7; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; -webkit-font-smoothing: antialiased; }
+  .loader { text-align: center; }
+  .spinner { width: 40px; height: 40px; border: 3px solid #e5e5ea; border-top-color: #007aff; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 20px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .title { font-size: 17px; font-weight: 600; color: #1d1d1f; letter-spacing: -0.01em; }
+  .sub { font-size: 13px; color: #8e8e93; margin-top: 6px; }
+</style></head>
+<body><div class="loader"><div class="spinner"></div><p class="title">Loading Sammy</p><p class="sub">Pulling live data from HubSpot</p></div></body></html>`;
 }
 
 // ══════════════════════════════════════════
