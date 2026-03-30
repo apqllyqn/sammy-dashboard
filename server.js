@@ -62,6 +62,11 @@ const REP_TARGETS = {
 // Active reps — Jared Korinko is inactive, excluded from daily scorecard/targets
 const ACTIVE_REPS = ['Lucas Gibson', 'Krishna Pryor'];
 
+// Commission Configuration
+const COMMISSION_CONFIG = {
+  perClose: 100, // $100 flat per close
+};
+
 // ══════════════════════════════════════════
 // CACHE
 // ══════════════════════════════════════════
@@ -758,6 +763,230 @@ function computeMRRWaterfall(deals, churnedCustomers, paidCustomers) {
   return { newMRR: Math.round(newMRR), newDeals, churnMRR: Math.round(churnMRR), churnCount, netMRR };
 }
 
+// ── NEW: Commission Tracker ──
+function computeCommissions(deals, owners, contacts, paidCustomers) {
+  const now = new Date();
+  const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const yearStart = new Date(now.getFullYear(), 0, 1);
+
+  // Get Monday of current week
+  const dayOfWeek = now.getDay();
+  const thisWeekStart = new Date(now);
+  thisWeekStart.setDate(now.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
+  thisWeekStart.setHours(0, 0, 0, 0);
+
+  const wonDeals = deals.filter(d => d.properties.dealstage === 'decisionmakerboughtin');
+  const perRep = {};
+
+  for (const repName of ACTIVE_REPS) {
+    perRep[repName] = { closesThisWeek: 0, commissionThisWeek: 0, closesThisMonth: 0, commissionThisMonth: 0, closesYTD: 0, commissionYTD: 0, dealBreakdown: [], conflicts: [], monthlyTrend: {} };
+  }
+
+  // Build contact owner map for conflict detection
+  const contactOwnerMap = {};
+  if (contacts) {
+    for (const [contactId, email] of Object.entries(contacts)) {
+      // We'll populate this from deals' associated contacts
+    }
+  }
+
+  for (const d of wonDeals) {
+    const oid = d.properties.hubspot_owner_id;
+    const repName = oid ? (owners[oid] || 'Unassigned') : 'Unassigned';
+    if (!ACTIVE_REPS.includes(repName)) continue;
+
+    const closeDate = new Date(d.properties.hs_v2_date_entered_decisionmakerboughtin || d.properties.closedate);
+    if (isNaN(closeDate)) continue;
+
+    const mrr = parseFloat(d.properties.expected_mrr || d.properties.amount || '0') || PRICING.default;
+    const commission = COMMISSION_CONFIG.perClose;
+    const monthKey = closeDate.toISOString().slice(0, 7); // YYYY-MM
+
+    const rep = perRep[repName];
+    if (!rep) continue;
+
+    // YTD
+    if (closeDate >= yearStart) { rep.closesYTD++; rep.commissionYTD += commission; }
+    // This month
+    if (closeDate >= thisMonthStart) { rep.closesThisMonth++; rep.commissionThisMonth += commission; }
+    // This week
+    if (closeDate >= thisWeekStart) { rep.closesThisWeek++; rep.commissionThisWeek += commission; }
+
+    // Monthly trend (last 6 months)
+    if (!rep.monthlyTrend[monthKey]) rep.monthlyTrend[monthKey] = { closes: 0, commission: 0 };
+    rep.monthlyTrend[monthKey].closes++;
+    rep.monthlyTrend[monthKey].commission += commission;
+
+    // Deal breakdown (this month)
+    if (closeDate >= thisMonthStart) {
+      // Check for contact owner conflict
+      let contactOwnerId = null;
+      const assoc = d.associations?.contacts?.results;
+      if (assoc && assoc.length > 0) {
+        // We'd need to fetch contact owner, but we have dealContactIdMap from parent
+        // For now we flag via the deal data
+        contactOwnerId = assoc[0]?.id || null;
+      }
+
+      rep.dealBreakdown.push({
+        id: d.id, name: d.properties.dealname, mrr, closeDate: closeDate.toISOString().split('T')[0],
+        commission, contactOwnerId,
+      });
+    }
+  }
+
+  // Build monthly trend labels (last 6 months)
+  const trendLabels = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    trendLabels.push(d.toISOString().slice(0, 7));
+  }
+
+  // Total team commission
+  let totalThisMonth = 0, totalYTD = 0;
+  for (const rep of Object.values(perRep)) {
+    totalThisMonth += rep.commissionThisMonth;
+    totalYTD += rep.commissionYTD;
+  }
+
+  return { perRep, trendLabels, totalThisMonth, totalYTD, perCloseRate: COMMISSION_CONFIG.perClose };
+}
+
+// ── NEW: Rep Leaderboard ──
+function computeLeaderboard(reps, weeklyRollup, commissions, deals, owners) {
+  const now = new Date();
+  const dayOfWeek = now.getDay();
+  const thisWeekStart = new Date(now);
+  thisWeekStart.setDate(now.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
+  thisWeekStart.setHours(0, 0, 0, 0);
+  const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  function computePeriodStats(periodStart) {
+    const repData = {};
+    for (const repName of ACTIVE_REPS) {
+      const rep = reps.find(r => r.name === repName) || {};
+      const wr = weeklyRollup[repName] || {};
+      const comm = commissions.perRep[repName] || {};
+
+      // Count won deals and MRR in period
+      let wonMRR = 0, dealsWon = 0, winCount = 0, lossCount = 0;
+      for (const d of deals) {
+        const oid = d.properties.hubspot_owner_id;
+        const name = oid ? (owners[oid] || 'Unassigned') : 'Unassigned';
+        if (name !== repName) continue;
+        const wonDate = new Date(d.properties.hs_v2_date_entered_decisionmakerboughtin || d.properties.closedate);
+        if (d.properties.dealstage === 'decisionmakerboughtin' && !isNaN(wonDate) && wonDate >= periodStart) {
+          wonMRR += parseFloat(d.properties.expected_mrr || d.properties.amount || '0') || PRICING.default;
+          dealsWon++;
+        }
+        if (d.properties.dealstage === 'decisionmakerboughtin') winCount++;
+        if (d.properties.dealstage === 'closedlost') lossCount++;
+      }
+      const winRate = (winCount + lossCount) > 0 ? Math.round((winCount / (winCount + lossCount)) * 100) : 0;
+
+      // Use weekly data for dials and hours (already computed for current week)
+      const dials = wr.totDials || 0;
+      const hours = wr.totHours || 0;
+      const commEarned = periodStart >= thisMonthStart ? (comm.commissionThisWeek || 0) : (comm.commissionThisMonth || 0);
+
+      repData[repName] = { wonMRR: Math.round(wonMRR), dealsWon, dials, hours, winRate, commEarned };
+    }
+    return repData;
+  }
+
+  function scoreReps(repData) {
+    const weights = { wonMRR: 0.30, commEarned: 0.20, dealsWon: 0.15, dials: 0.15, hours: 0.10, winRate: 0.10 };
+    const categories = Object.keys(weights);
+    const maxes = {};
+    for (const cat of categories) {
+      maxes[cat] = Math.max(...Object.values(repData).map(r => r[cat] || 0), 1);
+    }
+
+    const scored = {};
+    for (const [repName, data] of Object.entries(repData)) {
+      const catScores = {};
+      let composite = 0;
+      for (const cat of categories) {
+        const normalized = maxes[cat] > 0 ? Math.round((data[cat] / maxes[cat]) * 100) : 0;
+        catScores[cat] = { raw: data[cat], normalized };
+        composite += normalized * weights[cat];
+      }
+      scored[repName] = { composite: Math.round(composite), categories: catScores, ...data };
+    }
+
+    // Determine category leaders
+    const leaders = {};
+    for (const cat of categories) {
+      let best = null, bestVal = -1;
+      for (const [name, s] of Object.entries(scored)) {
+        if (s.categories[cat].raw > bestVal) { bestVal = s.categories[cat].raw; best = name; }
+      }
+      leaders[cat] = best;
+    }
+
+    // Rank
+    const ranked = Object.entries(scored).sort((a, b) => b[1].composite - a[1].composite);
+    return { ranked, leaders };
+  }
+
+  const weekData = computePeriodStats(thisWeekStart);
+  const monthData = computePeriodStats(thisMonthStart);
+  const allTimeData = computePeriodStats(new Date(0));
+
+  return {
+    week: scoreReps(weekData),
+    month: scoreReps(monthData),
+    allTime: scoreReps(allTimeData),
+  };
+}
+
+// ── NEW: Health Pulse ──
+function computeHealthPulse(winRate, coverageRatio, unitEconomics, woW, dataQuality) {
+  // Four component scores (0-100)
+  const pipelineCoverage = Math.min(Math.round((coverageRatio / 3) * 100), 100);
+  const winRateHealth = Math.min(Math.round((winRate / 25) * 100), 100);
+  const cacEfficiency = unitEconomics.ltvCacRatio ? Math.min(Math.round((unitEconomics.ltvCacRatio / 3) * 100), 100) : 0;
+
+  // Activity momentum: this week vs last week
+  let momentum = 50; // neutral
+  if (woW && woW.thisWeek && woW.lastWeek) {
+    const twActivity = woW.thisWeek.calls + woW.thisWeek.meetings;
+    const lwActivity = woW.lastWeek.calls + woW.lastWeek.meetings;
+    if (lwActivity > 0) {
+      const growth = (twActivity - lwActivity) / lwActivity;
+      momentum = Math.min(Math.max(Math.round(50 + growth * 50), 0), 100);
+    } else if (twActivity > 0) { momentum = 100; }
+  }
+
+  const components = [
+    { name: 'Pipeline Coverage', score: pipelineCoverage, detail: coverageRatio + 'x' },
+    { name: 'Win Rate', score: winRateHealth, detail: winRate + '%' },
+    { name: 'CAC Efficiency', score: cacEfficiency, detail: unitEconomics.ltvCacRatio ? unitEconomics.ltvCacRatio + ':1 LTV:CAC' : 'N/A' },
+    { name: 'Activity Momentum', score: momentum, detail: (woW?.deltas?.calls >= 0 ? '+' : '') + (woW?.deltas?.calls || 0) + '% WoW' },
+  ];
+
+  const overall = Math.round(components.reduce((s, c) => s + c.score, 0) / components.length);
+
+  // Auto-diagnosis: find weakest component
+  const weakest = components.reduce((a, b) => a.score < b.score ? a : b);
+  let diagnosis = '';
+  if (overall >= 70) {
+    diagnosis = 'Business is healthy — ' + components.reduce((a, b) => a.score > b.score ? a : b).name.toLowerCase() + ' is strong at ' + components.reduce((a, b) => a.score > b.score ? a : b).detail;
+  } else if (overall >= 40) {
+    diagnosis = weakest.name + ' needs attention at ' + weakest.detail;
+    if (weakest.name === 'Pipeline Coverage') diagnosis += ' — need more deals to hit 3x safety';
+    else if (weakest.name === 'Win Rate') diagnosis += ' — below 25% target';
+    else if (weakest.name === 'CAC Efficiency') diagnosis += ' — LTV:CAC below 3:1';
+    else if (weakest.name === 'Activity Momentum') diagnosis += ' — activity declining week-over-week';
+  } else {
+    diagnosis = 'Critical: ' + weakest.name.toLowerCase() + ' at ' + weakest.detail + ' — immediate action needed';
+  }
+
+  const color = overall >= 70 ? 'green' : (overall >= 40 ? 'amber' : 'red');
+
+  return { overall, color, diagnosis, components };
+}
+
 // ── NEW: Week-over-Week Comparison ──
 function computeWoWComparison(historicalByDay, availableDates, deals, owners) {
   const now = new Date();
@@ -1260,31 +1489,20 @@ function computeMetrics({ owners, deals: allDeals, dealEmailMap, dealContactIdMa
   const partialMetrics = { pnl, dealHealthScores, eb, dataQuality, todayKPIs, woW };
   const alerts = computeAlerts(partialMetrics);
 
-  // ── Executive Summary ──
-  const healthScore = Math.round(
-    (Math.min(winRate, 100) * 0.25) +
-    (Math.min(coverageRatio * 33, 100) * 0.25) +
-    ((unitEconomics.ltvCacRatio ? Math.min(unitEconomics.ltvCacRatio * 33, 100) : 0) * 0.25) +
-    (dataQuality.overallScore * 0.25)
-  );
+  // ── Commission Tracker ──
+  const commissions = computeCommissions(deals, owners, contactAnalyticsSources, paidCustomers);
 
-  // MRR sparkline data (daily MRR approximation — use won deal dates)
-  const mrrSparkline = [];
-  let runningMRR = currentMRR;
-  for (let i = 29; i >= 0; i--) {
-    mrrSparkline.push(runningMRR); // simplified: constant for now since we can't derive historical MRR without snapshots
-  }
+  // ── Leaderboard ──
+  const leaderboard = computeLeaderboard(reps, weeklyRollup, commissions, deals, owners);
 
+  // ── Health Pulse ──
+  const healthPulse = computeHealthPulse(winRate, coverageRatio, unitEconomics, woW, dataQuality);
+
+  // ── Legacy executive summary (for API compat) ──
   const executiveSummary = {
-    mrr: currentMRR,
-    mrrDelta7d: mrrWaterfall.netMRR,
-    customers: paidCount,
-    pipeline: Math.round(weightedPipelineValue),
-    winRate,
-    cac: pnl.cac,
-    healthScore,
-    alerts,
-    mrrSparkline,
+    mrr: currentMRR, mrrDelta7d: mrrWaterfall.netMRR, customers: paidCount,
+    pipeline: Math.round(weightedPipelineValue), winRate, cac: pnl.cac,
+    healthScore: healthPulse.overall, alerts,
   };
 
   // ── Cache metadata ──
@@ -1299,19 +1517,20 @@ function computeMetrics({ owners, deals: allDeals, dealEmailMap, dealContactIdMa
     reps, daily, actTotals, funnel: funnelData, activation,
     velocity: { avgCycle, medianCycle, wonCycleDays, avgAgeByStage, staleDeals, staleDealCount: staleDeals.length },
     dailyAvgByRep, repSlugMap, portalId: HUBSPOT_PORTAL, todayKPIs,
-    historicalByDay, availableDates, todayStr, eb, weeklyRollup, channelROI,
-    stageConversion, sourceCycle, dealHealth, weightedForecast, repChannelAttribution, touchVelocity,
+    historicalByDay, availableDates, todayStr, eb, weeklyRollup,
+    stageConversion, dealHealth,
     engagementTiers,
-    // NEW
     executiveSummary, dealHealthScores, bottlenecks, dataQuality, unitEconomics, mrrWaterfall, woW,
-    sourceAttribution, pipelineCoverage, bestChannel, dataFreshness, activeReps: ACTIVE_REPS,
+    pipelineCoverage, dataFreshness, activeReps: ACTIVE_REPS,
+    // NEW
+    commissions, leaderboard, healthPulse,
   };
 }
 
 // ══════════════════════════════════════════
 // HTML GENERATION
 // ══════════════════════════════════════════
-function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
+function generateHTML(data, { tab = 'health', rep = '', date = '' } = {}) {
   const json = JSON.stringify(data);
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1485,8 +1704,38 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
   }
   @media print { .no-print { display: none; } canvas { max-height: 300px; } }
 
-  /* ── Loading shimmer ── */
-  .health-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+  /* ── Health Pulse ── */
+  .pulse-hero { display: flex; align-items: center; gap: 16px; padding: 14px 20px; border-radius: var(--radius); margin-bottom: 12px; box-shadow: var(--shadow); }
+  .pulse-hero.pulse-green { background: linear-gradient(135deg, rgba(52,199,89,0.08), rgba(52,199,89,0.02)); border: 1px solid rgba(52,199,89,0.15); }
+  .pulse-hero.pulse-amber { background: linear-gradient(135deg, rgba(255,149,0,0.08), rgba(255,149,0,0.02)); border: 1px solid rgba(255,149,0,0.15); }
+  .pulse-hero.pulse-red { background: linear-gradient(135deg, rgba(255,59,48,0.08), rgba(255,59,48,0.02)); border: 1px solid rgba(255,59,48,0.15); }
+  .pulse-dot { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; animation: pulse-glow 2s ease-in-out infinite; }
+  .pulse-green .pulse-dot { background: var(--green); }
+  .pulse-amber .pulse-dot { background: var(--orange); }
+  .pulse-red .pulse-dot { background: var(--red); }
+  @keyframes pulse-glow { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .pulse-score { font-size: 28px; font-weight: 800; letter-spacing: -0.03em; line-height: 1; }
+  .pulse-diagnosis { font-size: 13px; font-weight: 500; color: var(--text-secondary); flex: 1; }
+
+  /* ── Commission Cards ── */
+  .commission-card { background: var(--surface); border-radius: var(--radius); padding: 24px; box-shadow: var(--shadow); }
+  .commission-amount { font-size: 36px; font-weight: 800; letter-spacing: -0.04em; line-height: 1; }
+  .commission-detail { font-size: 12px; color: var(--text-tertiary); margin-top: 6px; }
+
+  /* ── Leaderboard ── */
+  .podium { background: var(--surface); border-radius: var(--radius); padding: 24px; box-shadow: var(--shadow-md); text-align: center; border: 2px solid var(--blue); }
+  .podium-rank { font-size: 48px; font-weight: 900; color: var(--blue); letter-spacing: -0.04em; line-height: 1; }
+  .podium-name { font-size: 20px; font-weight: 700; margin-top: 8px; letter-spacing: -0.02em; }
+  .podium-score { font-size: 14px; color: var(--text-secondary); margin-top: 4px; }
+  .rank-badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 980px; font-size: 10px; font-weight: 700; background: var(--blue-bg); color: var(--blue); }
+
+  /* ── Conflict flag ── */
+  .conflict-flag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 980px; font-size: 10px; font-weight: 600; background: var(--orange-bg); color: var(--orange); }
+
+  /* ── Period toggle ── */
+  .period-toggle { display: flex; gap: 2px; background: var(--bg); border-radius: var(--radius-xs); padding: 2px; }
+  .period-btn { padding: 6px 14px; font-size: 12px; font-weight: 600; border: none; border-radius: 4px; cursor: pointer; background: transparent; color: var(--text-secondary); transition: all 0.15s; }
+  .period-btn.active { background: var(--surface); color: var(--text-primary); box-shadow: var(--shadow); }
 </style>
 </head>
 <body>
@@ -1501,9 +1750,6 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
           <div class="timestamp" id="timestamp"></div>
         </div>
         <div class="controls no-print">
-          <select id="repSelect" onchange="setRep(this.value)">
-            <option value="">All Reps</option>
-          </select>
           <div class="date-nav" id="dateNav">
             <button id="btnDatePrev" onclick="navigateDate(-1)">&lsaquo;</button>
             <span id="dateDisplay"></span>
@@ -1513,14 +1759,13 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
         </div>
       </div>
 
-      <div class="kpi-strip" id="execSummary"></div>
-      <div id="alertsBanner"></div>
+      <div id="healthPulse"></div>
 
       <nav class="tab-bar no-print">
-        <button id="btnToday" class="tab-btn" onclick="switchTab('today')">Today</button>
+        <button id="btnHealth" class="tab-btn" onclick="switchTab('health')">Health</button>
+        <button id="btnCommissions" class="tab-btn" onclick="switchTab('commissions')">Commissions</button>
+        <button id="btnLeaderboard" class="tab-btn" onclick="switchTab('leaderboard')">Leaderboard</button>
         <button id="btnPipeline" class="tab-btn" onclick="switchTab('pipeline')">Pipeline</button>
-        <button id="btnChannels" class="tab-btn" onclick="switchTab('channels')">Channels</button>
-        <button id="btnRevops" class="tab-btn" onclick="switchTab('revops')">RevOps</button>
       </nav>
     </div>
   </div>
@@ -1528,14 +1773,36 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
 
 <main class="container" style="padding-top:24px;padding-bottom:48px;">
 
-  <!-- TODAY -->
-  <div id="tabToday" class="space-y">
+  <!-- HEALTH -->
+  <div id="tabHealth" class="space-y">
+    <div id="healthComponentsSection"></div>
     <div id="scorecardSection"></div>
     <div id="drilldownSection" class="hidden"></div>
-    <div id="myDaySection"></div>
-    <div id="weeklySection"></div>
-    <div id="todayCESection"></div>
-    <div id="repComparisonSection"></div>
+    <div class="grid-1-1 gap-md">
+      <div class="card"><p class="section-subtitle">MRR Movement (30d)</p><canvas id="mrrWaterfallChart" height="200"></canvas></div>
+      <div class="card"><p class="section-subtitle">Week-over-Week</p><div id="wowSection"></div></div>
+    </div>
+  </div>
+
+  <!-- COMMISSIONS -->
+  <div id="tabCommissions" class="space-y hidden">
+    <div id="commissionCards"></div>
+    <div id="commissionTable"></div>
+    <div class="card"><p class="section-subtitle">Monthly Commission Trend</p><canvas id="commissionTrendChart" height="200"></canvas></div>
+  </div>
+
+  <!-- LEADERBOARD -->
+  <div id="tabLeaderboard" class="space-y hidden">
+    <div class="flex-between" style="margin-bottom:16px">
+      <p class="section-title" style="margin-bottom:0">Leaderboard</p>
+      <div class="period-toggle" id="periodToggle">
+        <button class="period-btn active" onclick="setPeriod('week')">Week</button>
+        <button class="period-btn" onclick="setPeriod('month')">Month</button>
+        <button class="period-btn" onclick="setPeriod('allTime')">All-Time</button>
+      </div>
+    </div>
+    <div id="podiumSection"></div>
+    <div id="categoryTable"></div>
   </div>
 
   <!-- PIPELINE -->
@@ -1545,53 +1812,8 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
       <div class="card"><canvas id="pipelineChart" height="260"></canvas></div>
       <div class="card"><p class="section-subtitle">Stage Conversion</p><div id="stageConversionSection"></div></div>
     </div>
-    <div class="grid-1-1 gap-md">
-      <div class="card"><p class="section-subtitle">Touch Velocity</p><canvas id="touchVelocityChart" height="200"></canvas></div>
-      <div class="card"><p class="section-subtitle">Deal Health Scores</p><div id="dealHealthScoresSection"></div></div>
-    </div>
+    <div class="card"><p class="section-subtitle">Deal Health Scores</p><div id="dealHealthScoresSection"></div></div>
     <div class="card"><p class="section-subtitle">Stale Deal Triage</p><div id="staleDealTriageSection"></div></div>
-  </div>
-
-  <!-- CHANNELS -->
-  <div id="tabChannels" class="space-y hidden">
-    <div id="dataQualityBanner"></div>
-    <div id="sourceAttributionSection"></div>
-    <div class="grid-1-1 gap-md">
-      <div class="card"><p class="section-subtitle">Deals by Source</p><canvas id="sourceChart" height="220"></canvas></div>
-      <div class="card"><p class="section-subtitle">Avg Cycle by Source</p><canvas id="sourceCycleChart" height="220"></canvas></div>
-    </div>
-    <div id="ebFunnelSection"></div>
-    <div id="ebCampaignSection"></div>
-    <div id="channelROISection"></div>
-    <div id="channelMixSection"></div>
-  </div>
-
-  <!-- REVOPS -->
-  <div id="tabRevops" class="space-y hidden">
-    <div class="grid-4" id="unitEconCards"></div>
-    <div class="grid-1-1 gap-md">
-      <div class="card"><p class="section-subtitle">MRR Movement (30d)</p><canvas id="mrrWaterfallChart" height="200"></canvas></div>
-      <div class="card"><p class="section-subtitle">Week-over-Week</p><div id="wowSection"></div></div>
-    </div>
-    <div class="grid-6" id="pnlCards"></div>
-    <div class="grid-1-1 gap-md">
-      <div class="card"><p class="section-subtitle">Cost Breakdown</p><table class="table" id="costTable"></table></div>
-      <div class="card"><p class="section-subtitle">MRR by Tier</p><div class="flex-center" style="gap:24px"><canvas id="mrrChart" style="max-height:160px"></canvas><div id="mrrLegend" class="space-y-sm"></div></div></div>
-    </div>
-    <div class="grid-1-1 gap-md">
-      <div class="card"><p class="section-subtitle">Conversion Funnel</p><canvas id="funnelChart" height="200"></canvas></div>
-      <div class="card"><p class="section-subtitle">Engagement Distribution</p><div class="flex-center" style="gap:24px"><canvas id="engScoreChart" style="max-height:160px"></canvas><div id="engScoreLegend" class="space-y-sm"></div></div></div>
-    </div>
-    <div class="grid-3" id="funnelKPIs"></div>
-    <div id="forecastSection"></div>
-    <div>
-      <p class="section-title">Deal Velocity</p>
-      <div class="grid-3 mt-sm" id="velocityKPIs"></div>
-      <div class="grid-1-1 gap-md mt-md">
-        <div class="card"><canvas id="velocityChart" height="220"></canvas></div>
-        <div class="card" style="max-height:400px;overflow-y:auto"><p class="section-subtitle">Stale Deals (&gt;30d)</p><table class="table" id="staleTable"></table></div>
-      </div>
-    </div>
   </div>
 
 </main>
@@ -1615,20 +1837,13 @@ function card(label, value, color, sub) {
     + (sub ? '<p class="metric-sub">' + sub + '</p>' : '') + '</div>';
 }
 
-function miniCard(label, value, color, sub) {
-  return '<div class="kpi-item">'
-    + '<p class="kpi-label">' + label + '</p>'
-    + '<p class="kpi-value" style="color:' + color + '">' + value + '</p>'
-    + (sub ? '<p class="kpi-sub">' + sub + '</p>' : '') + '</div>';
-}
-
 // ═══ STATE ═══
-const TABS = ['today','pipeline','channels','revops'];
-let activeTab = TABS.includes(TAB_INIT) ? TAB_INIT : 'today';
-let selectedRepName = null;
+const TABS = ['health','commissions','leaderboard','pipeline'];
+let activeTab = TABS.includes(TAB_INIT) ? TAB_INIT : 'health';
 let selectedDate = (DATE_INIT && D.availableDates.includes(DATE_INIT)) ? DATE_INIT : TODAY_STR;
 const renderedTabs = new Set();
 let drillDownRep = null;
+let lbPeriod = 'week';
 const charts = {};
 
 function formatDateDisplay(dateStr) {
@@ -1642,7 +1857,7 @@ function updateDateUI() {
   const idx = D.availableDates.indexOf(selectedDate);
   $('btnDatePrev').disabled = idx <= 0;
   $('btnDateNext').disabled = idx >= D.availableDates.length - 1;
-  $('dateNav').style.display = activeTab === 'today' ? 'flex' : 'none';
+  $('dateNav').style.display = activeTab === 'health' ? 'flex' : 'none';
 }
 
 function navigateDate(dir) {
@@ -1655,68 +1870,28 @@ function navigateDate(dir) {
 function setDate(dateStr) {
   selectedDate = dateStr;
   updateDateUI();
-  renderToday();
+  renderHealth();
   const url = new URL(window.location);
   if (dateStr === TODAY_STR) url.searchParams.delete('date');
   else url.searchParams.set('date', dateStr);
   history.replaceState(null, '', url);
 }
 
-// Find rep from slug
-if (REP_INIT) {
-  const slug = REP_INIT.toLowerCase();
-  selectedRepName = D.repSlugMap[slug] || D.reps.find(r => r.name.toLowerCase().includes(slug))?.name || null;
-}
-
-// Populate rep dropdown — only active reps
-const sel = $('repSelect');
-const salesReps = D.reps.filter(r => D.activeReps.includes(r.name));
-for (const r of salesReps) {
-  const opt = document.createElement('option');
-  opt.value = r.name;
-  opt.textContent = r.name;
-  if (r.name === selectedRepName) opt.selected = true;
-  sel.appendChild(opt);
-}
-
 $('timestamp').textContent = 'Live \\u2014 ' + D.generated;
 
-// ═══ EXECUTIVE SUMMARY (persistent) ═══
-function renderExecSummary() {
-  const es = D.executiveSummary;
-  const mrrArrow = es.mrrDelta7d >= 0 ? '\\u2191' : '\\u2193';
-  const mrrDeltaColor = es.mrrDelta7d >= 0 ? GREEN : RED;
-  const hsColor = es.healthScore >= 80 ? GREEN : (es.healthScore >= 50 ? AMBER : RED);
-  const cacColor = es.cac && es.cac < 300 ? GREEN : (es.cac && es.cac < 600 ? AMBER : RED);
-
-  $('execSummary').innerHTML = [
-    miniCard('MRR', fmt(es.mrr), GREEN, '<span style="color:' + mrrDeltaColor + '">' + mrrArrow + ' $' + Math.abs(es.mrrDelta7d) + ' (30d)</span>'),
-    miniCard('Customers', es.customers, BLUE, ''),
-    miniCard('Pipeline', fmt(es.pipeline), PURPLE, 'weighted'),
-    miniCard('Win Rate', pct(es.winRate), es.winRate >= 30 ? GREEN : AMBER, ''),
-    miniCard('CAC', es.cac ? fmt(es.cac) : 'N/A', cacColor, ''),
-    miniCard('Health', es.healthScore + '/100', hsColor, ''),
-  ].join('');
-
-  // Alerts banner
-  if (es.alerts && es.alerts.length > 0) {
-    let alertHTML = '';
-    for (const a of es.alerts.slice(0, 3)) {
-      const cls = 'alert alert-' + a.severity;
-      alertHTML += '<div class="' + cls + '">'
-        + '<span class="alert-icon">' + (a.severity === 'critical' ? '!' : a.severity === 'warning' ? '!' : 'i') + '</span>'
-        + '<span>' + a.message + '</span></div>';
-    }
-    $('alertsBanner').innerHTML = alertHTML;
-  } else {
-    $('alertsBanner').innerHTML = '';
-  }
-
-  if (D.dataFreshness && D.dataFreshness.isStale) {
-    $('alertsBanner').innerHTML += '<div class="alert alert-warning"><span class="alert-icon">!</span>Data is ' + D.dataFreshness.cacheAgeMinutes + ' minutes old</div>';
-  }
+// ═══ HEALTH PULSE (persistent) ═══
+function renderHealthPulse() {
+  const hp = D.healthPulse;
+  const colorMap = { green: GREEN, amber: AMBER, red: RED };
+  const scoreColor = colorMap[hp.color] || GRAY;
+  $('healthPulse').innerHTML = '<div class="pulse-hero pulse-' + hp.color + '">'
+    + '<div class="pulse-dot"></div>'
+    + '<div class="pulse-score" style="color:' + scoreColor + '">' + hp.overall + '</div>'
+    + '<div class="pulse-diagnosis">' + hp.diagnosis + '</div>'
+    + (D.dataFreshness && D.dataFreshness.isStale ? '<span class="badge badge-orange" style="font-size:10px">Data ' + D.dataFreshness.cacheAgeMinutes + 'm old</span>' : '')
+    + '</div>';
 }
-renderExecSummary();
+renderHealthPulse();
 
 // ═══ TAB SWITCHING ═══
 function switchTab(tab) {
@@ -1725,7 +1900,7 @@ function switchTab(tab) {
     const el = $('tab' + t.charAt(0).toUpperCase() + t.slice(1));
     if (el) el.classList.toggle('hidden', t !== tab);
     const btn = $('btn' + t.charAt(0).toUpperCase() + t.slice(1));
-    if (btn) { btn.classList.toggle('active', t === tab); btn.classList.toggle('bg-gray-50', t !== tab); }
+    if (btn) { btn.classList.toggle('active', t === tab); }
   }
   updateDateUI();
   if (!renderedTabs.has(tab)) { renderTab(tab); renderedTabs.add(tab); }
@@ -1736,171 +1911,66 @@ function switchTab(tab) {
 
 function renderTab(tab) {
   switch(tab) {
-    case 'today': renderToday(); break;
+    case 'health': renderHealth(); break;
+    case 'commissions': renderCommissions(); break;
+    case 'leaderboard': renderLeaderboard(); break;
     case 'pipeline': renderPipeline(); break;
-    case 'channels': renderChannels(); break;
-    case 'revops': renderRevOps(); break;
   }
 }
 
-function setRep(name) {
-  selectedRepName = name || null;
-  if (activeTab === 'today') renderToday();
-  const url = new URL(window.location);
-  if (name) url.searchParams.set('rep', name.split(' ')[0].toLowerCase());
-  else url.searchParams.delete('rep');
-  history.replaceState(null, '', url);
-}
-
-// ═══ TAB 1: TODAY ═══
-function renderToday() {
-  const rep = selectedRepName ? D.reps.find(r => r.name === selectedRepName) : null;
+// ═══ TAB 1: HEALTH ═══
+function renderHealth() {
   const dayData = D.historicalByDay[selectedDate] || D.today;
-  const todayData = selectedRepName ? (dayData.byRep[selectedRepName] || { calls: 0, meetings: 0, notes: 0 }) : dayData;
-  const avgData = selectedRepName ? (D.dailyAvgByRep[selectedRepName] || { calls: 0, meetings: 0, notes: 0, total: 0 }) : { calls: Math.round(D.actTotals.calls/30), meetings: Math.round(D.actTotals.meetings/30), notes: Math.round(D.actTotals.notes/30), total: D.today.dailyAvg };
-  const todayTotal = todayData.calls + todayData.meetings + todayData.notes;
-  const avgTotal = avgData.total || (avgData.calls + avgData.meetings + avgData.notes);
   const isToday = selectedDate === TODAY_STR;
   const dateLabel = formatDateDisplay(selectedDate);
 
+  // Health components detail
+  const hp = D.healthPulse;
+  let compHTML = '<div class="grid-4">';
+  for (const c of hp.components) {
+    const color = c.score >= 70 ? GREEN : (c.score >= 40 ? AMBER : RED);
+    compHTML += card(c.name, c.score + '/100', color, c.detail);
+  }
+  compHTML += '</div>';
+  $('healthComponentsSection').innerHTML = compHTML;
+
+  // Daily Scorecard
   renderScorecard();
 
-  const kpi = selectedRepName ? (dayData.kpis?.[selectedRepName] || null) : null;
-
-  if (kpi) {
-    function kpiBar(label, current, target, prefix, suffix) {
-      const pct = target > 0 ? Math.min(Math.round((current / target) * 100), 100) : 0;
-      const barCol = pct >= 100 ? GREEN : (pct >= 50 ? AMBER : RED);
-      return '<div style="margin-bottom:16px">'
-        + '<div class="flex-between" style="margin-bottom:6px">'
-        + '<span class="text-sm font-medium">' + label + '</span>'
-        + '<span class="text-sm font-bold" style="color:' + barCol + '">' + prefix + current + suffix + ' / ' + prefix + target + suffix + '</span></div>'
-        + '<div class="progress"><div class="progress-fill" style="width:' + pct + '%;background:' + barCol + '"></div></div></div>';
-    }
-    const overallPct = Math.round(((kpi.uniqueCalls / kpi.targets.uniqueCalls) + (kpi.callHours / kpi.targets.callHours) + (kpi.dailyRevenue / kpi.targets.dailyRevenue)) / 3 * 100);
-    const overallColor = overallPct >= 100 ? GREEN : (overallPct >= 50 ? AMBER : RED);
-    const overallText = overallPct >= 100 ? 'Targets hit' : (overallPct >= 50 ? 'Getting there' : (overallPct === 0 ? 'Not started' : 'Behind'));
-
-    $('myDaySection').innerHTML = '<div class="card">'
-      + '<div class="flex-between" style="margin-bottom:20px">'
-      + '<div><p class="section-title" style="margin-bottom:2px">' + selectedRepName.split(' ')[0] + "'s " + (isToday ? "Day" : dateLabel) + '</p>'
-      + '<p class="text-xs text-muted">Daily KPI targets</p></div>'
-      + '<span class="badge" style="background:' + overallColor + '14;color:' + overallColor + '">' + overallText + '</span></div>'
-      + kpiBar('Unique Dials', kpi.uniqueCalls, kpi.targets.uniqueCalls, '', '')
-      + kpiBar('Call Time', kpi.callHours, kpi.targets.callHours, '', 'h')
-      + kpiBar('Revenue', kpi.dailyRevenue, kpi.targets.dailyRevenue, '$', '')
-      + '<div style="margin-top:16px;padding-top:12px;border-top:0.5px solid var(--border)">'
-      + '<p class="text-sm text-muted font-medium">' + kpi.uniqueCalls + ' dials  ·  ' + kpi.callHours + 'h talk  ·  ' + todayData.meetings + ' meetings  ·  ' + todayData.notes + ' notes  ·  $' + kpi.dailyRevenue + ' closed</p>'
-      + '</div></div>';
-  } else {
-    const pctDone = avgTotal > 0 ? Math.min(Math.round((todayTotal / avgTotal) * 100), 100) : (todayTotal > 0 ? 100 : 0);
-    const barColor = pctDone >= 100 ? GREEN : (pctDone >= 50 ? AMBER : RED);
-    const statusText = pctDone >= 100 ? 'On pace' : (pctDone >= 50 ? 'Getting there' : (todayTotal === 0 ? 'Not started' : 'Behind'));
-
-    $('myDaySection').innerHTML = '<div class="card">'
-      + '<div class="flex-between" style="margin-bottom:16px">'
-      + '<div><p class="section-title" style="margin-bottom:2px">' + (selectedRepName ? selectedRepName.split(' ')[0] + "'s " + (isToday ? "Day" : dateLabel) : (isToday ? "Team Today" : "Team " + dateLabel)) + '</p>'
-      + '<p class="text-xs text-muted">Activity vs 30-day average</p></div>'
-      + '<span class="badge" style="background:' + barColor + '14;color:' + barColor + '">' + statusText + '</span></div>'
-      + '<div class="progress" style="margin-bottom:16px"><div class="progress-fill" style="width:' + pctDone + '%;background:' + barColor + '"></div></div>'
-      + '<p class="text-sm text-muted" style="margin-bottom:20px">' + todayTotal + ' of ' + avgTotal + ' daily avg (' + pctDone + '%)</p>'
-      + '<div class="grid-3" style="text-align:center">'
-      + '<div><p style="font-size:32px;font-weight:700;letter-spacing:-0.03em;color:' + BLUE + '">' + todayData.calls + '</p><p class="text-xs text-muted" style="margin-top:4px">Calls</p><p class="text-xs text-muted">avg ' + avgData.calls + '/day</p></div>'
-      + '<div><p style="font-size:32px;font-weight:700;letter-spacing:-0.03em;color:' + GREEN + '">' + todayData.meetings + '</p><p class="text-xs text-muted" style="margin-top:4px">Meetings</p><p class="text-xs text-muted">avg ' + avgData.meetings + '/day</p></div>'
-      + '<div><p style="font-size:32px;font-weight:700;letter-spacing:-0.03em;color:' + PURPLE + '">' + todayData.notes + '</p><p class="text-xs text-muted" style="margin-top:4px">Notes</p><p class="text-xs text-muted">avg ' + avgData.notes + '/day</p></div>'
-      + '</div></div>';
+  // MRR Waterfall
+  const mw = D.mrrWaterfall;
+  if (!charts.mrrWaterfall) {
+    charts.mrrWaterfall = new Chart($('mrrWaterfallChart'), {
+      type: 'bar',
+      data: {
+        labels: ['New MRR', 'Churn', 'Net'],
+        datasets: [{ data: [mw.newMRR, -mw.churnMRR, mw.netMRR], backgroundColor: [GREEN, RED, mw.netMRR >= 0 ? BLUE : RED], borderRadius: 4 }]
+      },
+      options: { responsive: true, plugins: { legend: { display: false }, title: { display: true, text: 'MRR Movement (' + mw.newDeals + ' new, ' + mw.churnCount + ' churned)' } }, scales: { y: { beginAtZero: true } } }
+    });
   }
 
-  // WEEKLY SUMMARY
-  if (selectedRepName && D.weeklyRollup[selectedRepName]) {
-    const wr = D.weeklyRollup[selectedRepName];
-    const bestLabel = wr.bestDay ? new Date(wr.bestDay.date + 'T12:00:00').toLocaleDateString('en-AU', { weekday: 'short' }) + ' \\u2014 ' + wr.bestDay.dials + ' dials, $' + wr.bestDay.revenue : 'N/A';
-    $('weeklySection').innerHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-      + '<h2 class="text-base font-semibold text-gray-800 mb-3">This Week (7 days)</h2>'
-      + '<div class="grid grid-cols-2 md:grid-cols-3 gap-3">'
-      + card('Dials', wr.totDials, BLUE, 'avg ' + wr.avgDials + '/day')
-      + card('Talk Time', wr.totHours + 'h', PURPLE, 'avg ' + wr.avgHours + 'h/day')
-      + card('Meetings', wr.totMeetings, GREEN, wr.days.length + ' days')
-      + card('Notes', wr.totNotes, CYAN, wr.days.length + ' days')
-      + card('Revenue', fmt(wr.totRevenue), GREEN, wr.days.length + ' days')
-      + card('Best Day', bestLabel, AMBER, '')
-      + '</div></div>';
-  } else if (!selectedRepName) {
-    let teamDials = 0, teamHours = 0, teamMeetings = 0, teamRevenue = 0;
-    for (const rn of Object.keys(D.weeklyRollup)) { const wr = D.weeklyRollup[rn]; teamDials += wr.totDials; teamHours += wr.totHours; teamMeetings += wr.totMeetings; teamRevenue += wr.totRevenue; }
-    $('weeklySection').innerHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-      + '<h2 class="text-base font-semibold text-gray-800 mb-3">Team This Week (7 days)</h2>'
-      + '<div class="grid grid-cols-2 md:grid-cols-4 gap-3">'
-      + card('Team Dials', teamDials, BLUE, Object.keys(D.weeklyRollup).length + ' reps')
-      + card('Talk Time', teamHours.toFixed(1) + 'h', PURPLE, '')
-      + card('Meetings', teamMeetings, GREEN, '')
-      + card('Revenue', fmt(teamRevenue), GREEN, '')
-      + '</div></div>';
-  } else { $('weeklySection').innerHTML = ''; }
-
-  // COLD EMAIL SUMMARY
-  if (D.eb && D.eb.attribution.total > 0) {
-    const a = D.eb.attribution;
-    if (selectedRepName) {
-      const repDeals = D.eb.repCEDeals?.[selectedRepName] || [];
-      const repAttr = a.byRep[selectedRepName];
-      if (repDeals.length > 0 || (repAttr && repAttr.total > 0)) {
-        let ceHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-          + '<h2 class="text-base font-semibold text-gray-800 mb-3">Cold Email Pipeline</h2>'
-          + '<div class="grid grid-cols-3 gap-3 mb-3">'
-          + card('CE Deals', repAttr?.total || 0, BLUE, 'from cold email')
-          + card('Won', repAttr?.won || 0, GREEN, fmt(repAttr?.wonMRR || 0) + ' MRR')
-          + card('In Pipeline', repAttr?.pipeline || 0, PURPLE, fmt(repAttr?.pipelineValue || 0))
-          + '</div>';
-        if (repDeals.length > 0) {
-          ceHTML += '<div class="space-y-2">';
-          for (const d of repDeals.filter(d => !d.lost).slice(0, 10)) {
-            const sc = d.won ? 'bg-green-50 text-green-600' : 'bg-blue-50 text-blue-600';
-            ceHTML += '<a href="https://app.hubspot.com/contacts/' + PORTAL + '/deal/' + d.id + '" target="_blank" class="flex items-center justify-between p-2 rounded-lg hover:bg-gray-50 border border-gray-50">'
-              + '<p class="text-sm font-medium text-gray-800 truncate flex-1">' + d.name + '</p>'
-              + '<span class="text-xs px-2 py-0.5 rounded-full ' + sc + ' mx-2">' + d.stage + '</span>'
-              + '<span class="text-sm font-medium text-gray-700">$' + d.value + '</span></a>';
-          }
-          ceHTML += '</div>';
-        }
-        $('todayCESection').innerHTML = ceHTML + '</div>';
-      } else { $('todayCESection').innerHTML = ''; }
-    } else {
-      $('todayCESection').innerHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-        + '<h2 class="text-base font-semibold text-gray-800 mb-3">Cold Email Pipeline</h2>'
-        + '<div class="grid grid-cols-2 md:grid-cols-4 gap-3">'
-        + card('Total CE Deals', a.total, BLUE, 'from cold email')
-        + card('In Pipeline', a.pipeline, PURPLE, fmt(a.pipelineValue) + ' value')
-        + card('Won', a.won, GREEN, fmt(a.wonMRR) + ' MRR')
-        + card('Reply Rate', pct(D.eb.totals.replyRate), D.eb.totals.replyRate >= 3 ? GREEN : AMBER, D.eb.totals.replies + ' replies')
-        + '</div></div>';
+  // Week-over-Week
+  if (D.woW) {
+    const w = D.woW;
+    function wowRow(label, tw, lw, d) {
+      const arrow = d >= 0 ? '\u2191' : '\u2193';
+      const cls = d >= 0 ? 'wow-up' : 'wow-down';
+      return '<tr><td class="py-2 text-sm">' + label + '</td>'
+        + '<td class="text-right py-2 font-medium">' + tw + '</td>'
+        + '<td class="text-right py-2 text-muted">' + lw + '</td>'
+        + '<td class="text-right py-2 ' + cls + ' font-bold">' + arrow + ' ' + Math.abs(d) + '%</td></tr>';
     }
-  } else { $('todayCESection').innerHTML = ''; }
-
-  // REP COMPARISON (merged from old Reps tab) — only show in team view
-  if (!selectedRepName) {
-    const activeReps = D.reps.filter(r => D.activeReps.includes(r.name));
-    if (activeReps.length > 0) {
-      let rcHTML = '<div class="card" style="padding:0;overflow:hidden"><div style="padding:20px 20px 12px"><p class="section-subtitle">Rep Comparison</p></div>'
-        + '<div class="overflow-auto"><table class="table">'
-        + '<thead><tr>'
-        + '<th>Rep</th><th class="right">Deals</th><th class="right">Won</th><th class="right">Lost</th><th class="right">Win%</th><th class="right">MRR</th><th class="right">Cycle</th><th class="right">$/Activity</th>'
-        + '</tr></thead><tbody>';
-      for (const r of activeReps) {
-        rcHTML += '<tr>'
-          + '<td class="font-medium">' + r.name + '</td>'
-          + '<td class="right">' + r.total + '</td>'
-          + '<td class="right text-green font-bold">' + r.won + '</td>'
-          + '<td class="right text-red">' + r.lost + '</td>'
-          + '<td class="right">' + r.winRate + '%</td>'
-          + '<td class="right font-bold text-green">$' + r.wonMRR.toLocaleString() + '</td>'
-          + '<td class="right muted">' + (r.avgCycleDays != null ? r.avgCycleDays + 'd' : '-') + '</td>'
-          + '<td class="right font-medium">$' + (r.efficiency || 0).toFixed(1) + '</td></tr>';
-      }
-      rcHTML += '</tbody></table></div></div>';
-      $('repComparisonSection').innerHTML = rcHTML;
-    }
-  } else { $('repComparisonSection').innerHTML = ''; }
+    $('wowSection').innerHTML = '<table class="table">'
+      + '<thead><tr><th>Metric</th><th class="right">This Week</th><th class="right">Last Week</th><th class="right">Delta</th></tr></thead><tbody>'
+      + wowRow('Calls', w.thisWeek.calls, w.lastWeek.calls, w.deltas.calls)
+      + wowRow('Unique Dials', w.thisWeek.uniqueDials, w.lastWeek.uniqueDials, w.deltas.uniqueDials)
+      + wowRow('Meetings', w.thisWeek.meetings, w.lastWeek.meetings, w.deltas.meetings)
+      + wowRow('Revenue', '$' + w.thisWeek.revenue, '$' + w.lastWeek.revenue, w.deltas.revenue)
+      + wowRow('Deals Created', w.thisWeek.dealsCreated, w.lastWeek.dealsCreated, w.deltas.dealsCreated)
+      + wowRow('Deals Won', w.thisWeek.dealsWon, w.lastWeek.dealsWon, w.deltas.dealsWon)
+      + '</tbody></table>';
+  }
 }
 
 // ═══ SCORECARD & DRILL-DOWN ═══
@@ -1910,19 +1980,12 @@ function renderScorecard() {
   let behindCount = 0;
 
   let html = '<div class="flex-between" style="margin-bottom:16px">'
-    + '<p class="section-title" style="margin-bottom:0">Daily Scorecard \\u2014 ' + formatDateDisplay(selectedDate) + '</p>'
+    + '<p class="section-title" style="margin-bottom:0">Daily Scorecard \u2014 ' + formatDateDisplay(selectedDate) + '</p>'
     + '<span id="behindBadge" class="badge"></span></div>';
 
   html += '<div class="card" style="padding:0;overflow:hidden"><div class="overflow-auto">'
     + '<table class="table"><thead><tr>'
-    + '<th>Rep</th>'
-    + '<th class="right">Dials</th>'
-    + '<th class="right">Unique</th>'
-    + '<th class="right">Hours</th>'
-    + '<th class="right">Mtgs</th>'
-    + '<th class="right">Notes</th>'
-    + '<th class="right">Revenue</th>'
-    + '<th class="right">Score</th>'
+    + '<th>Rep</th><th class="right">Dials</th><th class="right">Unique</th><th class="right">Hours</th><th class="right">Mtgs</th><th class="right">Notes</th><th class="right">Revenue</th><th class="right">Score</th>'
     + '</tr></thead><tbody>';
 
   for (const repName of repsWithTargets) {
@@ -1942,7 +2005,7 @@ function renderScorecard() {
     const isActive = drillDownRep === repName;
     const bgStyle = isActive ? 'background:var(--blue-bg)' : '';
 
-    html += '<tr class="clickable" style="' + borderStyle + ';' + bgStyle + '" onclick="toggleDrillDown(\\'' + repName.replace("'", "\\\\'") + '\\')">'
+    html += '<tr class="clickable" style="' + borderStyle + ';' + bgStyle + '" onclick="toggleDrillDown(\'' + repName.replace("'", "\\'") + '\')">'
       + '<td class="font-medium">' + repName + '</td>'
       + '<td class="right">' + rd.calls + '</td>'
       + '<td class="right ' + cellColor(dialPct) + '">' + kd.uniqueCalls + '</td>'
@@ -1950,11 +2013,9 @@ function renderScorecard() {
       + '<td class="right">' + rd.meetings + '</td>'
       + '<td class="right">' + rd.notes + '</td>'
       + '<td class="right ' + cellColor(revPct) + '">$' + kd.dailyRevenue + '</td>'
-      + '<td class="right"><span class="badge ' + scoreClass + '">' + score + '%</span></td>'
-      + '</tr>';
+      + '<td class="right"><span class="badge ' + scoreClass + '">' + score + '%</span></td></tr>';
   }
   html += '</tbody></table></div></div>';
-
   $('scorecardSection').innerHTML = html;
   const badge = $('behindBadge');
   if (behindCount > 0) { badge.className = 'badge badge-red'; badge.textContent = behindCount + ' rep' + (behindCount > 1 ? 's' : '') + ' behind'; }
@@ -1967,12 +2028,11 @@ function toggleDrillDown(repName) {
   }
   drillDownRep = repName; renderScorecard();
   const wr = D.weeklyRollup[repName]; const rep = D.reps.find(r => r.name === repName);
-  const a = D.eb?.attribution?.byRep?.[repName]; const ceDeals = D.eb?.repCEDeals?.[repName] || [];
 
   let html = '<div class="card" style="border:1.5px solid var(--blue);box-shadow:var(--shadow-lg)">'
     + '<div class="flex-between" style="margin-bottom:16px">'
-    + '<p class="section-title" style="margin-bottom:0">' + repName + ' \\u2014 7-Day Drill-Down</p>'
-    + '<button onclick="toggleDrillDown(\\'' + repName.replace("'", "\\\\'") + '\\')" class="text-xs text-muted" style="background:none;border:none;cursor:pointer">Close</button></div>';
+    + '<p class="section-title" style="margin-bottom:0">' + repName + ' \u2014 7-Day Drill-Down</p>'
+    + '<button onclick="toggleDrillDown(\'' + repName.replace("'", "\\'") + '\')" class="text-xs text-muted" style="background:none;border:none;cursor:pointer">Close</button></div>';
   if (wr && wr.days.length > 0) {
     html += '<div class="overflow-auto" style="margin-bottom:16px"><table class="table">'
       + '<thead><tr><th>Day</th><th class="right">Dials</th><th class="right">Hours</th><th class="right">Mtgs</th><th class="right">Revenue</th></tr></thead><tbody>';
@@ -1982,19 +2042,175 @@ function toggleDrillDown(repName) {
     }
     html += '<tr style="font-weight:700;border-top:1px solid var(--border-strong)"><td>Total</td><td class="right">' + wr.totDials + '</td><td class="right">' + wr.totHours + 'h</td><td class="right">' + wr.totMeetings + '</td><td class="right">$' + wr.totRevenue + '</td></tr></tbody></table></div>';
   }
-  html += '<div class="grid-4">';
+  html += '<div class="grid-3">';
   if (rep) { html += card('Open Deals', rep.open, BLUE, rep.total + ' total') + card('Won MRR', fmt(rep.wonMRR), GREEN, rep.won + ' deals') + card('Win Rate', pct(rep.winRate), rep.winRate >= 30 ? GREEN : AMBER, ''); }
-  if (a && a.total > 0) { html += card('CE Deals', a.total, CYAN, fmt(a.wonMRR) + ' won MRR'); }
-  html += '</div>';
-  if (ceDeals.length > 0) {
-    html += '<div class="mt-3"><p class="text-xs font-medium text-gray-500 uppercase mb-2">Cold Email Deals</p><div class="space-y-1">';
-    for (const d of ceDeals.filter(dd => !dd.lost).slice(0, 8)) { const sc = d.won ? 'text-green-600' : 'text-blue-600'; html += '<div class="flex justify-between text-xs py-1"><span class="truncate flex-1">' + d.name + '</span><span class="' + sc + ' font-medium ml-2">$' + d.value + '</span></div>'; }
-    html += '</div></div>';
-  }
-  html += '</div>'; $('drilldownSection').innerHTML = html; $('drilldownSection').classList.remove('hidden');
+  html += '</div></div>';
+  $('drilldownSection').innerHTML = html; $('drilldownSection').classList.remove('hidden');
 }
 
-// ═══ TAB 2: PIPELINE ═══
+// ═══ TAB 2: COMMISSIONS ═══
+function renderCommissions() {
+  const comm = D.commissions;
+  const activeReps = D.activeReps;
+
+  // Per-rep cards
+  let cardsHTML = '<div class="grid-2 gap-md">';
+  for (const repName of activeReps) {
+    const rc = comm.perRep[repName] || { closesThisMonth: 0, commissionThisMonth: 0, closesYTD: 0, commissionYTD: 0, closesThisWeek: 0, commissionThisWeek: 0, dealBreakdown: [], conflicts: [] };
+    const firstName = repName.split(' ')[0];
+    cardsHTML += '<div class="commission-card">'
+      + '<p class="card-label">' + firstName + '</p>'
+      + '<p class="commission-amount text-green">$' + rc.commissionThisMonth.toLocaleString() + '</p>'
+      + '<p class="commission-detail">' + rc.closesThisMonth + ' closes this month \u00b7 $' + comm.perCloseRate + '/close</p>'
+      + '<div class="grid-2 mt-md" style="gap:8px">'
+      + '<div class="metric-card card-sm"><p class="metric-label">This Week</p><p class="metric-value" style="color:' + BLUE + '">$' + rc.commissionThisWeek + '</p><p class="metric-sub">' + rc.closesThisWeek + ' closes</p></div>'
+      + '<div class="metric-card card-sm"><p class="metric-label">YTD</p><p class="metric-value" style="color:' + PURPLE + '">$' + rc.commissionYTD.toLocaleString() + '</p><p class="metric-sub">' + rc.closesYTD + ' closes</p></div>'
+      + '</div></div>';
+  }
+  cardsHTML += '</div>';
+
+  // Total team
+  cardsHTML += '<div class="card mt-md" style="text-align:center">'
+    + '<p class="card-label">Team Total This Month</p>'
+    + '<p class="card-value text-green">$' + comm.totalThisMonth.toLocaleString() + '</p>'
+    + '<p class="card-sub">YTD: $' + comm.totalYTD.toLocaleString() + '</p></div>';
+  $('commissionCards').innerHTML = cardsHTML;
+
+  // Deal breakdown table
+  let tableHTML = '<div class="card" style="padding:0;overflow:hidden"><div style="padding:20px 20px 12px"><p class="section-subtitle">Deals Closed This Month</p></div>'
+    + '<div class="overflow-auto"><table class="table"><thead><tr>'
+    + '<th>Deal</th><th>Rep</th><th class="right">MRR</th><th class="right">Commission</th><th class="right">Close Date</th><th></th>'
+    + '</tr></thead><tbody>';
+
+  let allDeals = [];
+  for (const repName of activeReps) {
+    const rc = comm.perRep[repName] || { dealBreakdown: [] };
+    for (const d of rc.dealBreakdown) {
+      allDeals.push({ ...d, repName });
+    }
+  }
+  allDeals.sort((a, b) => new Date(b.closeDate) - new Date(a.closeDate));
+
+  if (allDeals.length === 0) {
+    tableHTML += '<tr><td colspan="6" style="text-align:center;color:var(--text-tertiary);padding:24px">No closes this month yet</td></tr>';
+  }
+  for (const d of allDeals) {
+    tableHTML += '<tr>'
+      + '<td class="font-medium truncate" style="max-width:200px"><a href="https://app.hubspot.com/contacts/' + PORTAL + '/deal/' + d.id + '" target="_blank" style="color:inherit;text-decoration:none">' + d.name + '</a></td>'
+      + '<td>' + d.repName.split(' ')[0] + '</td>'
+      + '<td class="right">$' + d.mrr + '</td>'
+      + '<td class="right font-bold text-green">$' + d.commission + '</td>'
+      + '<td class="right muted">' + d.closeDate + '</td>'
+      + '<td><a href="https://app.hubspot.com/contacts/' + PORTAL + '/deal/' + d.id + '" target="_blank" class="badge badge-blue">View</a></td>'
+      + '</tr>';
+  }
+  tableHTML += '</tbody></table></div></div>';
+  $('commissionTable').innerHTML = tableHTML;
+
+  // Monthly trend chart
+  const trendData = {};
+  for (const repName of activeReps) {
+    trendData[repName] = comm.trendLabels.map(m => {
+      const rc = comm.perRep[repName];
+      return rc?.monthlyTrend[m]?.commission || 0;
+    });
+  }
+  const colors = [BLUE, PURPLE, GREEN, AMBER];
+  const datasets = activeReps.map((name, i) => ({
+    label: name.split(' ')[0],
+    data: trendData[name],
+    backgroundColor: colors[i % colors.length],
+    borderRadius: 4,
+  }));
+  charts.commissionTrend = new Chart($('commissionTrendChart'), {
+    type: 'bar',
+    data: { labels: comm.trendLabels.map(m => { const d = new Date(m + '-01'); return d.toLocaleDateString('en-AU', { month: 'short' }); }), datasets },
+    options: { responsive: true, plugins: { title: { display: true, text: 'Monthly Commission ($' + comm.perCloseRate + '/close)' } }, scales: { y: { beginAtZero: true } } }
+  });
+}
+
+// ═══ TAB 3: LEADERBOARD ═══
+function setPeriod(period) {
+  lbPeriod = period;
+  document.querySelectorAll('.period-btn').forEach(b => b.classList.toggle('active', b.textContent.toLowerCase().replace('-', '') === period.replace('allTime', 'all-time').replace('alltime', 'all-time')));
+  document.querySelectorAll('.period-btn').forEach(b => {
+    const map = { 'Week': 'week', 'Month': 'month', 'All-Time': 'allTime' };
+    b.classList.toggle('active', map[b.textContent] === period);
+  });
+  renderLeaderboardContent();
+}
+
+function renderLeaderboard() {
+  renderLeaderboardContent();
+}
+
+function renderLeaderboardContent() {
+  const lb = D.leaderboard[lbPeriod];
+  if (!lb || !lb.ranked || lb.ranked.length === 0) {
+    $('podiumSection').innerHTML = '<div class="card" style="text-align:center;padding:40px"><p class="text-muted">No leaderboard data available</p></div>';
+    $('categoryTable').innerHTML = '';
+    return;
+  }
+
+  const ranked = lb.ranked;
+  const leaders = lb.leaders;
+  const winner = ranked[0];
+  const runnerUp = ranked.length > 1 ? ranked[1] : null;
+
+  // Podium
+  let podiumHTML = '<div class="grid-2 gap-md">';
+  podiumHTML += '<div class="podium">'
+    + '<div class="podium-rank">#1</div>'
+    + '<div class="podium-name">' + winner[0] + '</div>'
+    + '<div class="podium-score">Composite Score: ' + winner[1].composite + '</div>'
+    + '<div class="grid-3 mt-md" style="gap:8px;text-align:center">'
+    + '<div><p class="text-xs text-muted">MRR</p><p class="font-bold text-green">$' + winner[1].wonMRR + '</p></div>'
+    + '<div><p class="text-xs text-muted">Commission</p><p class="font-bold text-green">$' + winner[1].commEarned + '</p></div>'
+    + '<div><p class="text-xs text-muted">Deals Won</p><p class="font-bold">' + winner[1].dealsWon + '</p></div>'
+    + '</div></div>';
+
+  if (runnerUp) {
+    podiumHTML += '<div class="card" style="text-align:center;border:1px solid var(--border)">'
+      + '<div style="font-size:32px;font-weight:800;color:var(--text-tertiary)">#2</div>'
+      + '<div class="podium-name">' + runnerUp[0] + '</div>'
+      + '<div class="podium-score">Composite Score: ' + runnerUp[1].composite + '</div>'
+      + '<div class="grid-3 mt-md" style="gap:8px;text-align:center">'
+      + '<div><p class="text-xs text-muted">MRR</p><p class="font-bold text-green">$' + runnerUp[1].wonMRR + '</p></div>'
+      + '<div><p class="text-xs text-muted">Commission</p><p class="font-bold text-green">$' + runnerUp[1].commEarned + '</p></div>'
+      + '<div><p class="text-xs text-muted">Deals Won</p><p class="font-bold">' + runnerUp[1].dealsWon + '</p></div>'
+      + '</div></div>';
+  }
+  podiumHTML += '</div>';
+  $('podiumSection').innerHTML = podiumHTML;
+
+  // Category comparison table
+  const catLabels = { wonMRR: 'MRR Closed', commEarned: 'Commission', dealsWon: 'Deals Won', dials: 'Unique Dials', hours: 'Call Hours', winRate: 'Win Rate' };
+  const catWeights = { wonMRR: '30%', commEarned: '20%', dealsWon: '15%', dials: '15%', hours: '10%', winRate: '10%' };
+  const catFmt = { wonMRR: v => '$' + v.toLocaleString(), commEarned: v => '$' + v, dealsWon: v => v, dials: v => v, hours: v => v.toFixed(1) + 'h', winRate: v => v + '%' };
+
+  let catHTML = '<div class="card" style="padding:0;overflow:hidden"><div class="overflow-auto"><table class="table"><thead><tr>'
+    + '<th>Category</th><th class="right">Weight</th>';
+  for (const [name] of ranked) { catHTML += '<th class="right">' + name.split(' ')[0] + '</th>'; }
+  catHTML += '<th class="right">Leader</th></tr></thead><tbody>';
+
+  for (const [cat, label] of Object.entries(catLabels)) {
+    catHTML += '<tr><td class="font-medium">' + label + '</td><td class="right muted">' + catWeights[cat] + '</td>';
+    for (const [name, data] of ranked) {
+      const isLeader = leaders[cat] === name;
+      const fmtFn = catFmt[cat] || (v => v);
+      const raw = data.categories[cat]?.raw ?? 0;
+      const norm = data.categories[cat]?.normalized ?? 0;
+      catHTML += '<td class="right' + (isLeader ? ' font-bold text-green' : '') + '">'
+        + fmtFn(raw) + ' <span class="text-xs text-muted">(' + norm + ')</span></td>';
+    }
+    const leaderName = leaders[cat] || '-';
+    catHTML += '<td class="right"><span class="rank-badge">' + leaderName.split(' ')[0] + '</span></td></tr>';
+  }
+  catHTML += '</tbody></table></div></div>';
+  $('categoryTable').innerHTML = catHTML;
+}
+
+// ═══ TAB 4: PIPELINE ═══
 function renderPipeline() {
   const pc = D.pipelineCoverage;
   const coverageColor = pc.ratio >= 3 ? GREEN : (pc.ratio >= 1 ? AMBER : RED);
@@ -2013,325 +2229,66 @@ function renderPipeline() {
     let convHTML = '';
     for (const c of D.stageConversion) {
       const color = c.rate >= 50 ? GREEN : (c.rate >= 25 ? AMBER : RED);
-      convHTML += '<div class="flex items-center justify-between py-2 border-b border-gray-50">'
-        + '<div class="text-xs"><span class="text-gray-600">' + c.from + '</span> <span class="text-gray-400">\\u2192</span> <span class="text-gray-600">' + c.to + '</span></div>'
-        + '<div class="flex items-center gap-2"><span class="text-xs text-gray-400">' + c.fromCount + '\\u2192' + c.toCount + '</span>'
+      convHTML += '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:0.5px solid var(--border)">'
+        + '<div class="text-xs"><span>' + c.from + '</span> <span class="text-muted">\u2192</span> <span>' + c.to + '</span></div>'
+        + '<div style="display:flex;align-items:center;gap:8px"><span class="text-xs text-muted">' + c.fromCount + '\u2192' + c.toCount + '</span>'
         + '<span class="text-sm font-bold" style="color:' + color + '">' + c.rate + '%</span></div></div>';
     }
     $('stageConversionSection').innerHTML = convHTML;
   }
 
-  // Touch Velocity
-  if (D.touchVelocity && D.touchVelocity.byStage.length > 0) {
-    const tv = D.touchVelocity.byStage.filter(s => s.dealCount > 0);
-    charts.touchVelocity = new Chart($('touchVelocityChart'), { type:'bar', data:{ labels:tv.map(s=>s.label), datasets:[{ label:'Avg Touches/Deal', data:tv.map(s=>s.avgTouches), backgroundColor:tv.map(s=>s.avgTouches>20?GREEN:(s.avgTouches>5?BLUE:AMBER)), borderRadius:4 }] }, options:{ responsive:true, plugins:{legend:{display:false},title:{display:true,text:'Avg Activities per Deal (30d)'}}, scales:{y:{beginAtZero:true}} } });
-  }
-
-  // Deal Health Scores (NEW - composite scoring)
+  // Deal Health Scores
   if (D.dealHealthScores) {
     const dhs = D.dealHealthScores;
-    let dhHTML = '<div class="grid grid-cols-4 gap-2 mb-3 text-center">'
-      + '<div><p class="text-lg font-bold" style="color:' + GREEN + '">' + dhs.counts.healthy + '</p><p class="text-xs text-gray-500">Healthy</p></div>'
-      + '<div><p class="text-lg font-bold" style="color:' + AMBER + '">' + dhs.counts.monitor + '</p><p class="text-xs text-gray-500">Monitor</p></div>'
-      + '<div><p class="text-lg font-bold" style="color:#ea580c">' + dhs.counts.attention + '</p><p class="text-xs text-gray-500">Attention</p></div>'
-      + '<div><p class="text-lg font-bold" style="color:' + RED + '">' + dhs.counts.critical + '</p><p class="text-xs text-gray-500">Critical</p></div></div>';
+    let dhHTML = '<div class="grid-4" style="text-align:center;margin-bottom:16px">'
+      + '<div><p style="font-size:20px;font-weight:700;color:' + GREEN + '">' + dhs.counts.healthy + '</p><p class="text-xs text-muted">Healthy</p></div>'
+      + '<div><p style="font-size:20px;font-weight:700;color:' + AMBER + '">' + dhs.counts.monitor + '</p><p class="text-xs text-muted">Monitor</p></div>'
+      + '<div><p style="font-size:20px;font-weight:700;color:' + '#ea580c' + '">' + dhs.counts.attention + '</p><p class="text-xs text-muted">Attention</p></div>'
+      + '<div><p style="font-size:20px;font-weight:700;color:' + RED + '">' + dhs.counts.critical + '</p><p class="text-xs text-muted">Critical</p></div></div>';
     const worstDeals = dhs.deals.filter(d => d.category !== 'healthy').slice(0, 10);
     if (worstDeals.length > 0) {
-      dhHTML += '<div class="space-y-1">';
+      dhHTML += '<table class="table"><thead><tr><th>Score</th><th>Deal</th><th>Stage</th><th class="right">Idle</th></tr></thead><tbody>';
       for (const d of worstDeals) {
         const cls = 'score-' + d.category;
-        dhHTML += '<div class="flex items-center justify-between text-xs py-1 border-b border-gray-50">'
-          + '<span class="' + cls + ' text-[10px] font-bold px-1.5 py-0.5 rounded mr-2">' + d.score + '</span>'
-          + '<a href="https://app.hubspot.com/contacts/' + PORTAL + '/deal/' + d.id + '" target="_blank" class="truncate flex-1 hover:text-blue-600">' + d.name + '</a>'
-          + '<span class="text-gray-400 mx-2">' + d.stage + '</span>'
-          + '<span class="text-gray-500">' + d.daysSinceUpdate + 'd idle</span></div>';
+        dhHTML += '<tr><td><span class="badge ' + cls + '" style="font-size:10px">' + d.score + '</span></td>'
+          + '<td><a href="https://app.hubspot.com/contacts/' + PORTAL + '/deal/' + d.id + '" target="_blank" class="truncate" style="color:inherit">' + d.name + '</a></td>'
+          + '<td class="muted">' + d.stage + '</td>'
+          + '<td class="right">' + d.daysSinceUpdate + 'd</td></tr>';
       }
-      dhHTML += '</div>';
+      dhHTML += '</tbody></table>';
     }
     $('dealHealthScoresSection').innerHTML = dhHTML;
   }
 
-  // Stale Deal Triage (NEW - grouped by severity)
+  // Stale Deal Triage
   if (D.dealHealthScores) {
     const allDeals = D.dealHealthScores.deals;
     const tiers = [
-      { label: '60+ days', min: 60, color: RED, deals: allDeals.filter(d => d.daysSinceUpdate >= 60) },
-      { label: '30-59 days', min: 30, color: '#ea580c', deals: allDeals.filter(d => d.daysSinceUpdate >= 30 && d.daysSinceUpdate < 60) },
-      { label: '14-29 days', min: 14, color: AMBER, deals: allDeals.filter(d => d.daysSinceUpdate >= 14 && d.daysSinceUpdate < 30) },
-      { label: '7-13 days', min: 7, color: BLUE, deals: allDeals.filter(d => d.daysSinceUpdate >= 7 && d.daysSinceUpdate < 14) },
+      { label: '60+ days', color: RED, deals: allDeals.filter(d => d.daysSinceUpdate >= 60) },
+      { label: '30-59 days', color: '#ea580c', deals: allDeals.filter(d => d.daysSinceUpdate >= 30 && d.daysSinceUpdate < 60) },
+      { label: '14-29 days', color: AMBER, deals: allDeals.filter(d => d.daysSinceUpdate >= 14 && d.daysSinceUpdate < 30) },
+      { label: '7-13 days', color: BLUE, deals: allDeals.filter(d => d.daysSinceUpdate >= 7 && d.daysSinceUpdate < 14) },
     ];
-    let triageHTML = '<div class="grid grid-cols-4 gap-2 mb-4">';
+    let triageHTML = '<div class="grid-4" style="text-align:center;margin-bottom:16px">';
     for (const t of tiers) {
-      triageHTML += '<div class="text-center p-2 rounded-lg" style="background:' + t.color + '10"><p class="text-lg font-bold" style="color:' + t.color + '">' + t.deals.length + '</p><p class="text-xs text-gray-500">' + t.label + '</p></div>';
+      triageHTML += '<div style="padding:12px;border-radius:var(--radius-sm);background:' + t.color + '10"><p style="font-size:20px;font-weight:700;color:' + t.color + '">' + t.deals.length + '</p><p class="text-xs text-muted">' + t.label + '</p></div>';
     }
     triageHTML += '</div>';
     const showDeals = tiers.flatMap(t => t.deals).slice(0, 15);
     if (showDeals.length > 0) {
-      triageHTML += '<div class="space-y-2">';
+      triageHTML += '<div style="display:flex;flex-direction:column;gap:8px">';
       for (const d of showDeals) {
-        const dc = d.daysSinceUpdate >= 60 ? 'text-red-600 font-bold' : (d.daysSinceUpdate >= 30 ? 'text-orange-600' : 'text-amber-600');
-        triageHTML += '<a href="https://app.hubspot.com/contacts/' + PORTAL + '/deal/' + d.id + '" target="_blank" class="flex items-center justify-between p-3 rounded-lg hover:bg-gray-50 border border-gray-50">'
-          + '<div class="min-w-0 flex-1"><p class="text-sm font-medium text-gray-800 truncate">' + d.name + '</p><p class="text-xs text-gray-400">' + d.rep + '</p></div>'
-          + '<span class="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 mx-2">' + d.stage + '</span>'
-          + '<span class="text-sm ' + dc + '">' + d.daysSinceUpdate + 'd idle</span></a>';
+        triageHTML += '<a href="https://app.hubspot.com/contacts/' + PORTAL + '/deal/' + d.id + '" target="_blank" class="deal-row">'
+          + '<div style="min-width:0;flex:1"><p class="text-sm font-medium truncate">' + d.name + '</p><p class="text-xs text-muted">' + d.rep + '</p></div>'
+          + '<span class="badge badge-gray" style="margin:0 8px">' + d.stage + '</span>'
+          + '<span class="text-sm font-bold" style="color:' + (d.daysSinceUpdate >= 60 ? RED : (d.daysSinceUpdate >= 30 ? '#ea580c' : AMBER)) + '">' + d.daysSinceUpdate + 'd</span></a>';
       }
       triageHTML += '</div>';
     } else {
-      triageHTML += '<p class="text-green-600 text-sm font-medium py-4 text-center">All deals are active!</p>';
+      triageHTML += '<p class="text-green text-sm font-medium" style="text-align:center;padding:16px">All deals are active!</p>';
     }
     $('staleDealTriageSection').innerHTML = triageHTML;
   }
-}
-
-// ═══ TAB 3: CHANNELS ═══
-function renderChannels() {
-  // Data Quality Banner
-  if (D.dataQuality) {
-    const dq = D.dataQuality;
-    const bannerColor = dq.sourcePct >= 80 ? 'bg-green-50 border-green-200 text-green-700' : (dq.sourcePct >= 50 ? 'bg-amber-50 border-amber-200 text-amber-700' : 'bg-red-50 border-red-200 text-red-700');
-    let dqHTML = '<div class="' + bannerColor + ' border rounded-xl p-4 mb-2">'
-      + '<h3 class="text-sm font-semibold mb-2">Data Quality</h3>'
-      + '<div class="grid grid-cols-4 gap-3 text-xs">'
-      + '<div>Source Known: <b>' + dq.sourcePct + '%</b></div>'
-      + '<div>Owner Assigned: <b>' + dq.ownerPct + '%</b></div>'
-      + '<div>Tier Set: <b>' + dq.tierPct + '%</b></div>'
-      + '<div>EB Sync: <b>' + (dq.ebSyncOk ? 'OK' : 'Issue') + '</b></div></div>';
-    if (D.sourceAttribution && D.sourceAttribution.improved > 0) {
-      dqHTML += '<p class="text-xs mt-2">Attribution fallback recovered ' + D.sourceAttribution.improved + ' deals from unknown</p>';
-    }
-    dqHTML += '</div>';
-    $('dataQualityBanner').innerHTML = dqHTML;
-  }
-
-  // Source Attribution Table
-  let satHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4"><h2 class="text-base font-semibold text-gray-800 mb-3">Source Attribution</h2>'
-    + '<div class="overflow-x-auto"><table class="w-full text-sm">'
-    + '<thead><tr class="border-b text-xs text-gray-500 uppercase tracking-wide">'
-    + '<th class="text-left py-2">Source</th><th class="text-right py-2">Total</th><th class="text-right py-2">Won</th><th class="text-right py-2">Lost</th><th class="text-right py-2">Open</th><th class="text-right py-2">Win%</th><th class="text-right py-2">MRR</th><th class="text-right py-2">Avg Cycle</th>'
-    + '</tr></thead><tbody>';
-  for (const s of D.sourceStats) {
-    satHTML += '<tr class="border-b border-gray-50"><td class="py-2">' + s.label + '</td>'
-      + '<td class="text-right py-2">' + s.total + '</td>'
-      + '<td class="text-right py-2 text-green-600 font-medium">' + s.won + '</td>'
-      + '<td class="text-right py-2 text-red-500">' + s.lost + '</td>'
-      + '<td class="text-right py-2">' + s.open + '</td>'
-      + '<td class="text-right py-2">' + s.winRate + '%</td>'
-      + '<td class="text-right py-2 font-medium">$' + s.wonMRR.toLocaleString() + '</td>'
-      + '<td class="text-right py-2">' + (s.avgCycleDays != null ? s.avgCycleDays + 'd' : '-') + '</td></tr>';
-  }
-  satHTML += '</tbody></table></div></div>';
-  $('sourceAttributionSection').innerHTML = satHTML;
-
-  charts.source = new Chart($('sourceChart'), { type:'bar', data:{ labels:D.sourceStats.map(s=>s.label), datasets:[ {label:'Won',data:D.sourceStats.map(s=>s.won),backgroundColor:GREEN,borderRadius:4}, {label:'Lost',data:D.sourceStats.map(s=>s.lost),backgroundColor:RED,borderRadius:4}, {label:'Open',data:D.sourceStats.map(s=>s.open),backgroundColor:LGRAY,borderRadius:4} ] }, options:{ responsive:true, plugins:{title:{display:true,text:'Deals by Source'}}, scales:{y:{beginAtZero:true}} } });
-
-  if (D.sourceCycle) {
-    const srcs = Object.values(D.sourceCycle).filter(s => s.count > 0);
-    if (srcs.length > 0) {
-      charts.sourceCycle = new Chart($('sourceCycleChart'), { type:'bar', data:{ labels:srcs.map(s=>s.label), datasets:[{ label:'Avg Days to Close', data:srcs.map(s=>s.avgDays), backgroundColor:srcs.map(s=>s.avgDays>30?AMBER:BLUE), borderRadius:4 }] }, options:{ responsive:true, plugins:{legend:{display:false},title:{display:true,text:'Avg Days to Close by Source'}}, scales:{y:{beginAtZero:true}} } });
-    }
-  }
-
-  // EB Funnel
-  if (D.eb) {
-    const eb = D.eb, t = eb.totals, a = eb.attribution, co = eb.costs;
-    let ebHTML = '<div class="bg-white rounded-xl border border-gray-100 p-4"><h2 class="text-base font-semibold text-gray-800 mb-3">EmailBison Funnel</h2>';
-    if (!eb.syncHealthy) { ebHTML += '<div class="alert-warning border rounded-lg px-3 py-1.5 text-xs mb-3">All leads show same status \\u2014 EB sync may be stale. Raw statuses: ' + Object.entries(eb.debugStatuses).map(function(e){return e[0]+'='+e[1]}).join(', ') + '</div>'; }
-    ebHTML += '<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">'
-      + '<div><canvas id="ebFunnelChart" height="200"></canvas></div>'
-      + '<div class="grid grid-cols-2 gap-3">'
-      + card('Leads', t.leads.toLocaleString(), BLUE, eb.campaignMetrics.length + ' campaigns')
-      + card('Reply Rate', pct(t.replyRate), t.replyRate >= 3 ? GREEN : AMBER, t.replies + ' replies')
-      + card('Cost/Lead', co.costPerLead != null ? '$' + co.costPerLead.toFixed(2) : 'N/A', BLUE, '$' + co.monthlySpend + '/mo')
-      + card('Cost/Reply', co.costPerReply != null ? '$' + co.costPerReply.toFixed(0) : 'N/A', co.costPerReply && co.costPerReply < 50 ? GREEN : AMBER, '')
-      + card('Cost/Deal', co.costPerDeal != null ? '$' + co.costPerDeal : 'N/A', co.costPerDeal && co.costPerDeal < D.pnl.arpu * 3 ? GREEN : RED, a.total + ' deals')
-      + card('Won MRR', fmt(a.wonMRR), GREEN, a.won + ' won')
-      + '</div></div></div>';
-    $('ebFunnelSection').innerHTML = ebHTML;
-
-    if (eb.funnel && eb.funnel.length > 0) {
-      const fc = [BLUE, CYAN, AMBER, PURPLE, GREEN, BLUE, GREEN];
-      charts.ebFunnel = new Chart($('ebFunnelChart'), { type:'bar', data:{ labels:eb.funnel.map(f=>f.label), datasets:[{data:eb.funnel.map(f=>f.value),backgroundColor:fc.slice(0,eb.funnel.length),borderRadius:4}] }, options:{indexAxis:'y',responsive:true,plugins:{legend:{display:false}},scales:{x:{beginAtZero:true}}} });
-    }
-
-    // Campaign cards with ROI
-    let ccHTML = '<h3 class="text-sm font-medium text-gray-500 mb-3">Campaign Performance</h3><div class="grid grid-cols-1 md:grid-cols-2 gap-3">';
-    for (const c of eb.campaignMetrics) {
-      const sb = c.status==='active'?'bg-green-50 text-green-600':(c.status==='paused'?'bg-amber-50 text-amber-600':'bg-gray-100 text-gray-600');
-      ccHTML += '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-        + '<div class="flex justify-between items-start mb-2"><p class="text-sm font-semibold text-gray-800 truncate flex-1">' + c.name + '</p><span class="text-xs px-2 py-0.5 rounded-full ' + sb + ' ml-2">' + c.status + '</span></div>'
-        + '<div class="grid grid-cols-3 gap-2 text-xs">'
-        + '<div><p class="text-gray-500">Leads</p><p class="font-bold">' + c.leads + '</p></div>'
-        + '<div><p class="text-gray-500">Sent</p><p class="font-bold">' + c.sent + '</p></div>'
-        + '<div><p class="text-gray-500">Opens</p><p class="font-bold">' + c.opens + ' (' + c.openRate + '%)</p></div>'
-        + '<div><p class="text-gray-500">Replies</p><p class="font-bold text-blue-600">' + c.replies + '</p></div>'
-        + '<div><p class="text-gray-500">Interested</p><p class="font-bold text-green-600">' + c.interested + '</p></div>'
-        + '<div><p class="text-gray-500">Spend</p><p class="font-bold">$' + c.allocatedSpend + '</p></div></div></div>';
-    }
-    ccHTML += '</div>';
-    $('ebCampaignSection').innerHTML = ccHTML;
-  } else {
-    $('ebFunnelSection').innerHTML = '<div class="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-700">EmailBison data unavailable</div>';
-    $('ebCampaignSection').innerHTML = '';
-  }
-
-  // Channel ROI
-  if (D.channelROI) {
-    const cr = D.channelROI;
-    $('channelROISection').innerHTML = '<h2 class="text-base font-semibold text-gray-800 mb-3">Spend ROI by Channel</h2>'
-      + '<div class="grid grid-cols-1 md:grid-cols-3 gap-4">'
-      + '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-      + '<h3 class="text-sm font-medium text-gray-500 mb-2">Cold Email</h3>'
-      + '<p class="text-2xl font-bold" style="color:' + (cr.coldEmail.roi > 10 ? GREEN : AMBER) + '">' + cr.coldEmail.roi + '% ROI</p>'
-      + '<p class="text-xs text-gray-500 mt-1">' + fmt(cr.coldEmail.spend) + ' spend \\u2192 ' + fmt(cr.coldEmail.wonMRR) + ' MRR</p>'
-      + '<p class="text-xs text-gray-500">' + cr.coldEmail.won + ' won | CAC: ' + (cr.coldEmail.cac ? fmt(cr.coldEmail.cac) : 'N/A') + '</p></div>'
-      + '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-      + '<h3 class="text-sm font-medium text-gray-500 mb-2">Cold Call / Sales</h3>'
-      + '<p class="text-2xl font-bold" style="color:' + (cr.coldCall.roi > 10 ? GREEN : AMBER) + '">' + cr.coldCall.roi + '% ROI</p>'
-      + '<p class="text-xs text-gray-500 mt-1">' + fmt(cr.coldCall.spend) + ' spend \\u2192 ' + fmt(cr.coldCall.wonMRR) + ' MRR</p>'
-      + '<p class="text-xs text-gray-500">' + cr.coldCall.won + ' won | CAC: ' + (cr.coldCall.cac ? fmt(cr.coldCall.cac) : 'N/A') + '</p></div>'
-      + '<div class="bg-white rounded-xl border border-gray-100 p-4">'
-      + '<h3 class="text-sm font-medium text-gray-500 mb-2">Total</h3>'
-      + '<p class="text-2xl font-bold" style="color:' + (cr.total.roi > 10 ? GREEN : AMBER) + '">' + cr.total.roi + '% ROI</p>'
-      + '<p class="text-xs text-gray-500 mt-1">' + fmt(cr.total.spend) + ' spend \\u2192 ' + fmt(cr.total.wonMRR) + ' MRR</p></div></div>';
-  }
-
-  // Channel Mix Recommendation (NEW)
-  if (D.bestChannel) {
-    $('channelMixSection').innerHTML = '<div class="bg-green-50 border border-green-200 rounded-xl p-4">'
-      + '<h3 class="text-sm font-semibold text-green-800 mb-1">Best Channel: ' + D.bestChannel.name + '</h3>'
-      + '<p class="text-xs text-green-700">Lowest CAC at ' + (D.bestChannel.cac ? fmt(D.bestChannel.cac) : 'N/A') + ' | ' + D.bestChannel.won + ' deals won | ' + fmt(D.bestChannel.wonMRR) + ' MRR</p></div>';
-  } else { $('channelMixSection').innerHTML = ''; }
-}
-
-// ═══ TAB 4: REVOPS (was Revenue) ═══
-function renderRevOps() {
-  // Unit Economics cards
-  const ue = D.unitEconomics;
-  const ltvColor = ue.ltvCacRatio && ue.ltvCacRatio >= 3 ? GREEN : (ue.ltvCacRatio && ue.ltvCacRatio >= 1 ? AMBER : RED);
-  const paybackColor = ue.monthsToPayback && ue.monthsToPayback <= 6 ? GREEN : (ue.monthsToPayback && ue.monthsToPayback <= 12 ? AMBER : RED);
-  $('unitEconCards').innerHTML = [
-    card('LTV (12mo)', fmt(ue.ltv), BLUE, 'ARPU ' + fmt(ue.arpu) + ' x 12'),
-    card('LTV:CAC', ue.ltvCacRatio ? ue.ltvCacRatio + ':1' : 'N/A', ltvColor, ue.ltvCacRatio >= 3 ? 'Healthy' : 'Below 3:1 target'),
-    card('Payback', ue.monthsToPayback ? ue.monthsToPayback + ' months' : 'N/A', paybackColor, 'CAC / ARPU'),
-    card('Break-Even', ue.currentCustomers + '/' + ue.breakEven, ue.gap === 0 ? GREEN : AMBER, ue.gap > 0 ? ue.gap + ' more needed' : 'Achieved!'),
-  ].join('');
-
-  // MRR Waterfall
-  const mw = D.mrrWaterfall;
-  charts.mrrWaterfall = new Chart($('mrrWaterfallChart'), {
-    type: 'bar',
-    data: {
-      labels: ['New MRR', 'Churn', 'Net'],
-      datasets: [{
-        data: [mw.newMRR, -mw.churnMRR, mw.netMRR],
-        backgroundColor: [GREEN, RED, mw.netMRR >= 0 ? BLUE : RED],
-        borderRadius: 4,
-      }]
-    },
-    options: { responsive: true, plugins: { legend: { display: false }, title: { display: true, text: 'MRR Movement (' + mw.newDeals + ' new, ' + mw.churnCount + ' churned)' } }, scales: { y: { beginAtZero: true } } }
-  });
-
-  // Week-over-Week
-  if (D.woW) {
-    const w = D.woW;
-    function wowRow(label, tw, lw, d) {
-      const arrow = d >= 0 ? '\\u2191' : '\\u2193';
-      const cls = d >= 0 ? 'wow-up' : 'wow-down';
-      return '<tr class="border-b border-gray-50"><td class="py-2 text-sm">' + label + '</td>'
-        + '<td class="text-right py-2 font-medium">' + tw + '</td>'
-        + '<td class="text-right py-2 text-gray-400">' + lw + '</td>'
-        + '<td class="text-right py-2 ' + cls + ' font-bold">' + arrow + ' ' + Math.abs(d) + '%</td></tr>';
-    }
-    $('wowSection').innerHTML = '<table class="w-full text-sm">'
-      + '<thead><tr class="border-b text-xs text-gray-500 uppercase"><th class="text-left py-2">Metric</th><th class="text-right py-2">This Week</th><th class="text-right py-2">Last Week</th><th class="text-right py-2">Delta</th></tr></thead><tbody>'
-      + wowRow('Calls', w.thisWeek.calls, w.lastWeek.calls, w.deltas.calls)
-      + wowRow('Unique Dials', w.thisWeek.uniqueDials, w.lastWeek.uniqueDials, w.deltas.uniqueDials)
-      + wowRow('Meetings', w.thisWeek.meetings, w.lastWeek.meetings, w.deltas.meetings)
-      + wowRow('Revenue', '$' + w.thisWeek.revenue, '$' + w.lastWeek.revenue, w.deltas.revenue)
-      + wowRow('Deals Created', w.thisWeek.dealsCreated, w.lastWeek.dealsCreated, w.deltas.dealsCreated)
-      + wowRow('Deals Won', w.thisWeek.dealsWon, w.lastWeek.dealsWon, w.deltas.dealsWon)
-      + '</tbody></table>';
-  }
-
-  // P&L
-  const profitColor = D.pnl.monthlyProfit >= 0 ? GREEN : RED;
-  const roiColor = D.pnl.roi > 0 ? GREEN : (D.pnl.roi > -25 ? AMBER : RED);
-  const cacColor = D.pnl.cac && D.pnl.cac < D.pnl.arpu * 3 ? GREEN : (D.pnl.cac && D.pnl.cac < D.pnl.arpu * 6 ? AMBER : RED);
-  $('pnlCards').innerHTML = [
-    card('Current MRR', fmt(D.pnl.currentMRR) + '/mo', D.pnl.currentMRR > 0 ? GREEN : GRAY, D.pnl.paidCount + ' paid'),
-    card('Monthly Costs', fmt(D.pnl.totalCosts) + '/mo', GRAY, Object.keys(D.pnl.costs).length + ' items'),
-    card('Profit', (D.pnl.monthlyProfit >= 0 ? '+' : '-') + fmt(D.pnl.monthlyProfit), profitColor),
-    card('ROI', pct(D.pnl.roi), roiColor, 'return on spend'),
-    card('CAC', D.pnl.cac ? fmt(D.pnl.cac) : 'N/A', cacColor, D.pnl.cac ? 'per customer' : ''),
-    card('Break-Even', D.pnl.paidCount >= D.pnl.breakEvenCustomers ? 'Achieved' : D.pnl.breakEvenCustomers + ' needed', D.pnl.paidCount >= D.pnl.breakEvenCustomers ? GREEN : AMBER, D.pnl.paidCount + '/' + D.pnl.breakEvenCustomers + ' at $' + D.pnl.arpu + ' ARPU'),
-  ].join('');
-
-  let costRows = '<tbody>';
-  for (const [name, amount] of Object.entries(D.pnl.costs)) costRows += '<tr class="border-b border-gray-50"><td class="py-1.5">' + name + '</td><td class="text-right py-1.5 font-medium">$' + amount.toLocaleString() + '</td></tr>';
-  costRows += '<tr class="font-bold"><td class="py-1.5">Total</td><td class="text-right py-1.5">$' + D.pnl.totalCosts.toLocaleString() + '</td></tr></tbody>';
-  $('costTable').innerHTML = costRows;
-
-  const mrrLabels = [], mrrValues = [], mrrColors = [GREEN, BLUE, PURPLE, GRAY];
-  if (D.pnl.mrrBreakdown.basic) { mrrLabels.push('Basic ($59)'); mrrValues.push(D.pnl.mrrBreakdown.basic); }
-  if (D.pnl.mrrBreakdown.pro) { mrrLabels.push('Pro ($99)'); mrrValues.push(D.pnl.mrrBreakdown.pro); }
-  if (D.pnl.mrrBreakdown.team) { mrrLabels.push('Team ($249)'); mrrValues.push(D.pnl.mrrBreakdown.team); }
-  if (D.pnl.mrrBreakdown.unknown) { mrrLabels.push('Unknown ($59)'); mrrValues.push(D.pnl.mrrBreakdown.unknown); }
-  if (mrrValues.length > 0) {
-    charts.mrr = new Chart($('mrrChart'), { type:'doughnut', data:{ labels:mrrLabels, datasets:[{ data:mrrValues, backgroundColor:mrrColors.slice(0,mrrValues.length) }] }, options:{ plugins:{ legend:{ display:false } }, cutout:'60%' } });
-    $('mrrLegend').innerHTML = mrrLabels.map((l,i) => '<div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full" style="background:'+mrrColors[i]+'"></span><span>'+l+': <b>'+mrrValues[i]+'</b></span></div>').join('');
-  }
-
-  // Engagement Score Distribution
-  const ET = D.engagementTiers;
-  if (ET && (ET.onFire + ET.hot + ET.warm + ET.cold) > 0) {
-    const engLabels = ['On Fire', 'Hot', 'Warm', 'Cold'];
-    const engValues = [ET.onFire, ET.hot, ET.warm, ET.cold];
-    const engColors = [RED, AMBER, BLUE, GRAY];
-    charts.engScore = new Chart($('engScoreChart'), { type:'doughnut', data:{ labels:engLabels, datasets:[{ data:engValues, backgroundColor:engColors }] }, options:{ plugins:{ legend:{ display:false } }, cutout:'60%' } });
-    $('engScoreLegend').innerHTML = engLabels.map((l,i) => '<div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full" style="background:'+engColors[i]+'"></span><span>'+l+': <b>'+engValues[i]+'</b></span></div>').join('');
-  }
-
-  // Funnel
-  const F = D.funnel;
-  charts.funnel = new Chart($('funnelChart'), { type:'bar', data:{ labels:['All Contacts','Started Trial','Active Trial','Paid'], datasets:[{ data:[F.totalContacts,F.activeTrial+F.paid+F.expired+F.churned,F.activeTrial,F.paid], backgroundColor:[LGRAY,CYAN,BLUE,GREEN], borderRadius:4 }] }, options:{ indexAxis:'y', responsive:true, plugins:{legend:{display:false},title:{display:true,text:'Conversion Funnel'}}, scales:{x:{beginAtZero:true}} } });
-  $('funnelKPIs').innerHTML = [
-    card('Signup\\u2192Trial', pct(F.signupToTrialRate), BLUE, (F.activeTrial+F.paid+F.expired+F.churned)+' of '+F.totalContacts),
-    card('Trial\\u2192Paid', pct(F.trialToPaidRate), GREEN, F.paid+' converted'),
-    card('Overall', pct(F.overallConversion), F.overallConversion>=5?GREEN:AMBER, 'contacts to paid'),
-    card('Expired', F.expired, RED, 'did not convert'),
-    card('Churned', F.churned, RED, 'lost after paying'),
-    card('Active Trials', F.activeTrial, BLUE, 'in progress'),
-  ].join('');
-
-  // Weighted Forecast
-  if (D.weightedForecast) {
-    const wf = D.weightedForecast;
-    $('forecastSection').innerHTML = '<h2 class="text-base font-semibold text-gray-800 mb-3">Weighted Forecast</h2>'
-      + '<div class="grid grid-cols-1 md:grid-cols-3 gap-4">'
-      + '<div class="bg-white rounded-xl border border-gray-100 p-4"><h3 class="text-sm font-medium text-gray-500 mb-1">This Month</h3>'
-      + '<p class="text-2xl font-bold" style="color:' + GREEN + '">' + fmt(wf.thisMonth.weighted) + '</p>'
-      + '<p class="text-xs text-gray-400">' + wf.thisMonth.deals + ' deals | ' + fmt(wf.thisMonth.value) + ' unweighted</p></div>'
-      + '<div class="bg-white rounded-xl border border-gray-100 p-4"><h3 class="text-sm font-medium text-gray-500 mb-1">Next Month</h3>'
-      + '<p class="text-2xl font-bold" style="color:' + BLUE + '">' + fmt(wf.nextMonth.weighted) + '</p>'
-      + '<p class="text-xs text-gray-400">' + wf.nextMonth.deals + ' deals | ' + fmt(wf.nextMonth.value) + ' unweighted</p></div>'
-      + '<div class="bg-white rounded-xl border border-gray-100 p-4"><h3 class="text-sm font-medium text-gray-500 mb-1">Later</h3>'
-      + '<p class="text-2xl font-bold" style="color:' + PURPLE + '">' + fmt(wf.later.weighted) + '</p>'
-      + '<p class="text-xs text-gray-400">' + wf.later.deals + ' deals | ' + fmt(wf.later.value) + ' unweighted</p></div></div>';
-  }
-
-  // Velocity
-  $('velocityKPIs').innerHTML = [
-    card('Avg Cycle', D.velocity.avgCycle!=null?D.velocity.avgCycle+' days':'N/A', BLUE),
-    card('Median Cycle', D.velocity.medianCycle!=null?D.velocity.medianCycle+' days':'N/A', PURPLE),
-    card('Stale Deals', D.velocity.staleDealCount, D.velocity.staleDealCount>5?RED:(D.velocity.staleDealCount>0?AMBER:GREEN), '>30d in stage'),
-  ].join('');
-  const velStages = D.velocity.avgAgeByStage.filter(s=>s.count>0);
-  charts.velocity = new Chart($('velocityChart'), { type:'bar', data:{ labels:velStages.map(s=>s.label), datasets:[{ label:'Avg Days', data:velStages.map(s=>s.avgDays), backgroundColor:velStages.map(s=>s.avgDays>30?RED:(s.avgDays>14?AMBER:BLUE)), borderRadius:4 }] }, options:{ responsive:true, plugins:{legend:{display:false},title:{display:true,text:'Avg Days in Stage'}}, scales:{y:{beginAtZero:true}} } });
-  if (D.velocity.staleDeals.length > 0) {
-    let staleRows = '<thead><tr class="border-b text-xs text-gray-500 uppercase"><th class="text-left py-2">Deal</th><th class="text-left py-2">Stage</th><th class="text-right py-2">Days</th><th class="text-left py-2">Rep</th></tr></thead><tbody>';
-    for (const d of D.velocity.staleDeals) { const color=d.days>60?'text-red-600 font-bold':'text-amber-600'; staleRows+='<tr class="border-b border-gray-50"><td class="py-1.5 max-w-[160px] truncate"><a href="https://app.hubspot.com/contacts/'+PORTAL+'/deal/'+d.id+'" target="_blank" class="hover:text-blue-600">'+d.name+'</a></td><td class="py-1.5 text-xs">'+d.stage+'</td><td class="text-right py-1.5 '+color+'">'+d.days+'</td><td class="py-1.5 text-xs">'+d.rep+'</td></tr>'; }
-    $('staleTable').innerHTML = staleRows + '</tbody>';
-  } else { $('staleTable').parentElement.innerHTML = '<p class="text-green-600 text-sm font-medium">No stale deals!</p>'; }
 }
 
 // ═══ INIT ═══
@@ -2406,7 +2363,7 @@ app.get('/', async (req, res) => {
     refreshCache();
   }
   if (cache.data) {
-    const tab = req.query.tab || 'today';
+    const tab = req.query.tab || 'health';
     const rep = req.query.rep || '';
     const date = req.query.date || '';
     res.type('html').send(generateHTML(cache.data, { tab, rep, date }));
