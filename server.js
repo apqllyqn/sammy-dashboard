@@ -2005,7 +2005,7 @@ function renderScorecard() {
     const isActive = drillDownRep === repName;
     const bgStyle = isActive ? 'background:var(--blue-bg)' : '';
 
-    html += '<tr class="clickable" style="' + borderStyle + ';' + bgStyle + '" onclick="toggleDrillDown(\'' + repName.replace("'", "\\'") + '\')">'
+    html += '<tr class="clickable" style="' + borderStyle + ';' + bgStyle + '" onclick="toggleDrillDown(' + JSON.stringify(repName).replace(/"/g, '&quot;') + ')">'
       + '<td class="font-medium">' + repName + '</td>'
       + '<td class="right">' + rd.calls + '</td>'
       + '<td class="right ' + cellColor(dialPct) + '">' + kd.uniqueCalls + '</td>'
@@ -2032,7 +2032,7 @@ function toggleDrillDown(repName) {
   let html = '<div class="card" style="border:1.5px solid var(--blue);box-shadow:var(--shadow-lg)">'
     + '<div class="flex-between" style="margin-bottom:16px">'
     + '<p class="section-title" style="margin-bottom:0">' + repName + ' \u2014 7-Day Drill-Down</p>'
-    + '<button onclick="toggleDrillDown(\'' + repName.replace("'", "\\'") + '\')" class="text-xs text-muted" style="background:none;border:none;cursor:pointer">Close</button></div>';
+    + '<button onclick="toggleDrillDown(' + JSON.stringify(repName).replace(/"/g, '&quot;') + ')" class="text-xs text-muted" style="background:none;border:none;cursor:pointer">Close</button></div>';
   if (wr && wr.days.length > 0) {
     html += '<div class="overflow-auto" style="margin-bottom:16px"><table class="table">'
       + '<thead><tr><th>Day</th><th class="right">Dials</th><th class="right">Hours</th><th class="right">Mtgs</th><th class="right">Revenue</th></tr></thead><tbody>';
