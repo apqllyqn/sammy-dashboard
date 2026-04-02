@@ -62,6 +62,11 @@ const REP_TARGETS = {
 // Active reps — Jared Korinko is inactive, excluded from daily scorecard/targets
 const ACTIVE_REPS = ['Lucas Gibson', 'Krishna Pryor'];
 
+// Commission Configuration
+const COMMISSION_CONFIG = {
+  perClose: 100, // $100 flat per close
+};
+
 // ══════════════════════════════════════════
 // CACHE
 // ══════════════════════════════════════════
