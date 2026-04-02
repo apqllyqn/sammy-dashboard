@@ -1552,6 +1552,7 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sammy AI - RevOps</title>
+<script src="https://cdn.tailwindcss.com"><\/script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
   :root {
@@ -1630,14 +1631,16 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
 
   /* ── Tables ── */
   .table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  .table th { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-tertiary); padding: 10px 12px; text-align: left; border-bottom: 0.5px solid var(--border-strong); }
+  .table th { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-tertiary); padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border-strong); position: sticky; top: 0; background: var(--surface); z-index: 2; }
   .table th.right { text-align: right; }
-  .table td { padding: 10px 12px; border-bottom: 0.5px solid var(--border); color: var(--text-primary); }
+  .table td { padding: 12px 14px; border-bottom: 0.5px solid var(--border); color: var(--text-primary); }
   .table td.right { text-align: right; }
   .table td.muted { color: var(--text-tertiary); }
   .table tr { transition: background 0.15s; }
-  .table tr:hover { background: var(--surface-hover); }
+  .table tbody tr:nth-child(even) { background: rgba(0,0,0,0.015); }
+  .table tr:hover { background: rgba(0,122,255,0.04); }
   .table tr.clickable { cursor: pointer; }
+  .num { font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace; font-weight: 600; }
 
   /* ── Badges ── */
   .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 980px; font-size: 11px; font-weight: 600; }
@@ -1732,10 +1735,29 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
   .commission-amount { font-size: 36px; font-weight: 800; letter-spacing: -0.04em; line-height: 1; }
 
   /* ── Priority Alerts ── */
-  .priority-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 14px; border-radius: var(--radius-xs); font-size: 13px; font-weight: 500; margin-bottom: 4px; }
-  .priority-critical { background: var(--red-bg); color: var(--red); }
-  .priority-warning { background: var(--orange-bg); color: var(--orange); }
-  .priority-info { background: var(--blue-bg); color: var(--blue); }
+  .priority-item { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: var(--radius-sm); font-size: 14px; font-weight: 500; margin-bottom: 6px; line-height: 1.4; }
+  .priority-critical { background: var(--red-bg); color: var(--red); border-left: 3px solid var(--red); }
+  .priority-warning { background: var(--orange-bg); color: var(--orange); border-left: 3px solid var(--orange); }
+  .priority-info { background: var(--blue-bg); color: var(--blue); border-left: 3px solid var(--blue); }
+  .priority-icon { width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 800; flex-shrink: 0; color: white; }
+  .priority-critical .priority-icon { background: var(--red); }
+  .priority-warning .priority-icon { background: var(--orange); }
+  .priority-info .priority-icon { background: var(--blue); }
+
+  /* ── Score Pills ── */
+  .score-pill { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 980px; font-size: 12px; font-weight: 700; min-width: 50px; justify-content: center; }
+  .score-green { background: var(--green-bg); color: var(--green); }
+  .score-amber { background: var(--orange-bg); color: var(--orange); }
+  .score-red { background: var(--red-bg); color: var(--red); }
+
+  /* ── Plan Badges ── */
+  .plan-badge { display: inline-flex; padding: 2px 8px; border-radius: 980px; font-size: 11px; font-weight: 600; }
+  .plan-founder { background: var(--green-bg); color: var(--green); }
+  .plan-monthly { background: var(--blue-bg); color: var(--blue); }
+  .plan-other { background: rgba(0,0,0,0.05); color: var(--text-secondary); }
+
+  /* ── Closer Dots ── */
+  .closer-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
 
   /* ── Responsive ── */
   @media (max-width: 768px) {
@@ -2240,15 +2262,16 @@ function renderScorecard() {
     const isActive = drillDownRep === repName;
     const bgStyle = isActive ? 'background:var(--blue-bg)' : '';
 
+    var scorePillClass = score >= 100 ? 'score-green' : (score >= 50 ? 'score-amber' : 'score-red');
     html += '<tr class="clickable" style="' + borderStyle + ';' + bgStyle + '" onclick="toggleDrillDown(' + JSON.stringify(repName).replace(/"/g, '&quot;') + ')">'
-      + '<td class="font-medium">' + repName + '</td>'
-      + '<td class="right">' + rd.calls + '</td>'
-      + '<td class="right ' + cellColor(dialPct) + '">' + kd.uniqueCalls + '</td>'
-      + '<td class="right ' + cellColor(hoursPct) + '">' + kd.callHours + 'h</td>'
-      + '<td class="right">' + rd.meetings + '</td>'
-      + '<td class="right">' + rd.notes + '</td>'
-      + '<td class="right ' + cellColor(revPct) + '">$' + kd.dailyRevenue + '</td>'
-      + '<td class="right"><span class="badge ' + scoreClass + '">' + score + '%</span></td>'
+      + '<td style="font-weight:700;white-space:nowrap">' + repName + '</td>'
+      + '<td class="right num">' + rd.calls + '</td>'
+      + '<td class="right num ' + cellColor(dialPct) + '">' + kd.uniqueCalls + '</td>'
+      + '<td class="right num ' + cellColor(hoursPct) + '">' + kd.callHours + 'h</td>'
+      + '<td class="right num">' + rd.meetings + '</td>'
+      + '<td class="right num">' + rd.notes + '</td>'
+      + '<td class="right num ' + cellColor(revPct) + '">$' + kd.dailyRevenue + '</td>'
+      + '<td class="right"><span class="score-pill ' + scorePillClass + '">' + score + '%</span></td>'
       + '</tr>';
   }
   html += '</tbody></table></div></div>';
@@ -2635,11 +2658,20 @@ function renderRevOps() {
 // ═══ PRIORITIES ═══
 function renderPriorities() {
   if (!D.priorities || D.priorities.length === 0) { $('prioritiesSection').innerHTML = ''; return; }
-  let html = '<div class="card" style="padding:16px"><p class="section-subtitle" style="margin-bottom:8px">Action Items</p>';
-  for (const p of D.priorities.slice(0, 6)) {
+  var items = D.priorities.slice(0, 5);
+  var hasMore = D.priorities.length > 5;
+  var html = '<div class="card" style="padding:20px;border-left:4px solid var(--orange)">'
+    + '<div class="flex-between" style="margin-bottom:12px"><p class="section-title" style="margin-bottom:0;font-size:16px">Action Items</p>'
+    + '<span class="badge badge-' + (items[0].severity === 'critical' ? 'red' : 'orange') + '">' + D.priorities.length + ' items</span></div>';
+  for (var i = 0; i < items.length; i++) {
+    var p = items[i];
+    var icon = p.severity === 'critical' ? '!' : (p.severity === 'warning' ? '!' : 'i');
     html += '<div class="priority-item priority-' + p.severity + '">'
-      + '<span style="font-weight:800">' + (p.severity === 'critical' ? '!' : (p.severity === 'warning' ? '!' : 'i')) + '</span>'
+      + '<div class="priority-icon">' + icon + '</div>'
       + '<span>' + p.message + '</span></div>';
+  }
+  if (hasMore) {
+    html += '<p class="text-xs text-muted" style="text-align:center;margin-top:8px;cursor:pointer" onclick="this.parentElement.querySelectorAll(\\'.priority-hidden\\').forEach(function(e){e.style.display=\\'flex\\'});this.style.display=\\'none\\'">Show ' + (D.priorities.length - 5) + ' more...</p>';
   }
   html += '</div>';
   $('prioritiesSection').innerHTML = html;
@@ -2689,12 +2721,19 @@ function renderCommissions() {
     html += '</div>';
 
     // Roster table
-    html += '<div class="overflow-auto"><table class="table"><thead><tr><th>#</th><th>Customer</th><th>Plan</th><th class="right">MRR</th><th>Closed By</th><th>Date</th></tr></thead><tbody>';
-    comm.customerRoster.forEach(function(c, i) {
-      const closerColor = c.closer === D.activeReps[0] ? 'color:' + BLUE : (c.closer === D.activeReps[1] ? 'color:' + PURPLE : (c.closer === 'Unattributed' ? 'color:' + RED : ''));
-      html += '<tr><td class="muted">' + (i + 1) + '</td><td class="font-medium">' + c.name + '</td><td>' + c.plan + '</td><td class="right num">$' + c.mrr + '</td><td style="' + closerColor + ';font-weight:700">' + c.closer + '</td><td class="muted">' + c.closeDate + '</td></tr>';
+    var maxVisible = 15;
+    var roster = comm.customerRoster;
+    html += '<div class="overflow-auto" style="max-height:500px"><table class="table"><thead><tr><th>#</th><th>Customer</th><th>Plan</th><th class="right">MRR</th><th>Closed By</th><th>Date</th></tr></thead><tbody>';
+    roster.forEach(function(c, i) {
+      var closerDotColor = c.closer === D.activeReps[0] ? BLUE : (c.closer === D.activeReps[1] ? PURPLE : (c.closer === 'Unattributed' ? RED : GRAY));
+      var planClass = c.plan.includes('Founder') ? 'plan-founder' : (c.plan.includes('99') ? 'plan-monthly' : 'plan-other');
+      var hiddenStyle = i >= maxVisible ? ' style="display:none" class="roster-hidden"' : '';
+      html += '<tr' + hiddenStyle + '><td class="muted">' + (i + 1) + '</td><td style="font-weight:600">' + c.name + '</td><td><span class="plan-badge ' + planClass + '">' + c.plan + '</span></td><td class="right num">$' + c.mrr + '</td><td><span class="closer-dot" style="background:' + closerDotColor + '"></span><span style="font-weight:600">' + c.closer + '</span></td><td class="muted">' + c.closeDate + '</td></tr>';
     });
     html += '</tbody></table></div>';
+    if (roster.length > maxVisible) {
+      html += '<p class="text-xs" style="text-align:center;margin-top:8px;cursor:pointer;color:var(--blue)" onclick="document.querySelectorAll(\\'.roster-hidden\\').forEach(function(e){e.style.display=\\'table-row\\'});this.style.display=\\'none\\'">Show all ' + roster.length + ' customers</p>';
+    }
   }
 
   html += '</div>';
@@ -2769,7 +2808,8 @@ function renderLeaderboardContent() {
       var raw = ranked[ri2][1].categories[cat] ? ranked[ri2][1].categories[cat].raw : 0;
       var norm = ranked[ri2][1].categories[cat] ? ranked[ri2][1].categories[cat].normalized : 0;
       var fmtFn = catFmt[cat] || function(v){return v};
-      catHTML += '<td class="right' + (isLeader ? ' font-bold text-green' : '') + '">' + fmtFn(raw) + ' <span class="text-muted text-xs">(' + norm + ')</span></td>';
+      var barColor = isLeader ? GREEN : BLUE;
+      catHTML += '<td class="right">' + fmtFn(raw) + '<div class="progress" style="height:4px;margin-top:4px;width:80px;display:inline-block;vertical-align:middle;margin-left:8px"><div class="progress-fill" style="width:' + norm + '%;background:' + barColor + '"></div></div></td>';
     }
     catHTML += '<td class="right"><span class="badge badge-blue">' + (leaders[cat] || '').split(' ')[0] + '</span></td></tr>';
   }
