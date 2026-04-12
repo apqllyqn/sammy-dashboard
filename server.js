@@ -458,7 +458,9 @@ function computeDayMetrics(dateStr, activity, deals, owners) {
     const dayCalls = (activity.calls || []).filter(c => {
       if (!ids.includes(c.properties.hubspot_owner_id)) return false;
       const cd = c.properties.hs_createdate;
-      return cd && cd.startsWith(dateStr);
+      if (!cd) return false;
+      const melbDate = new Date(cd).toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' });
+      return melbDate === dateStr;
     });
 
     const uniqueNumbers = new Set();
@@ -933,29 +935,65 @@ function generateHTML(data, { view = 'rep', rep = '', date = '' } = {}) {
     </div>
   </div>
 
-  <!-- My Pipeline -->
-  <h2 class="text-lg font-semibold text-gray-900 mb-3">My Pipeline</h2>
-  <div class="card p-6 mb-6">
-    ${STAGES.filter(s => !['closedlost', 'decisionmakerboughtin'].includes(s.id)).map(s => {
-      const stageData = repPipelineDeals[s.id] || { deals: [], count: 0 };
-      return `<div class="mb-4 last:mb-0">
-        <div class="flex items-center justify-between mb-2">
-          <span class="text-sm font-medium text-gray-700">${s.label}</span>
-          <span class="text-sm text-gray-500">${stageData.count} deal${stageData.count !== 1 ? 's' : ''}</span>
-        </div>
-        ${stageData.deals.length > 0 ? `<div class="space-y-1.5">
-          ${stageData.deals.map(d => {
-            const health = d.daysSinceMod <= 3 ? 'bg-green-500' : d.daysSinceMod <= 7 ? 'bg-amber-500' : 'bg-red-500';
-            return `<div class="flex items-center gap-3 py-1.5 px-3 bg-gray-50 rounded-lg text-sm">
-              <span class="health-dot ${health}"></span>
-              <span class="flex-1 text-gray-700">${escapeHtml(d.name)}</span>
-              <span class="text-gray-400 text-xs">${d.daysSinceMod}d ago</span>
-              ${d.value > 0 ? `<span class="text-gray-600 font-medium">$${d.value}</span>` : ''}
-            </div>`;
-          }).join('')}
-        </div>` : '<div class="text-sm text-gray-400 italic">No deals in this stage</div>'}
-      </div>`;
-    }).join('<hr class="my-3 border-gray-100">')}
+  <!-- Daily Activity -->
+  <h2 class="text-lg font-semibold text-gray-900 mb-3">Today's Activity</h2>
+  <div class="grid grid-cols-3 gap-4 mb-6">
+    <div class="card p-4 text-center">
+      <div class="text-3xl font-bold text-blue-600" id="act-calls">${repDay.dials || 0}</div>
+      <div class="text-xs text-gray-500 mt-1">Calls</div>
+    </div>
+    <div class="card p-4 text-center">
+      <div class="text-3xl font-bold text-green-600" id="act-meetings">${repDay.weekDemos || 0}</div>
+      <div class="text-xs text-gray-500 mt-1">Demos/Week</div>
+    </div>
+    <div class="card p-4 text-center">
+      <div class="text-3xl font-bold text-purple-600" id="act-talktime">${repDay.talkTimeHrs || '0.0'}h</div>
+      <div class="text-xs text-gray-500 mt-1">Talk Time</div>
+    </div>
+  </div>
+
+  <!-- My Pipeline (collapsible) -->
+  <div class="mb-6">
+    <button onclick="document.getElementById('pipeline-detail').classList.toggle('hidden');this.querySelector('.chevron').classList.toggle('rotate-90')" class="flex items-center justify-between w-full text-left mb-3 group">
+      <h2 class="text-lg font-semibold text-gray-900">My Pipeline</h2>
+      <div class="flex items-center gap-2">
+        <span class="text-sm text-gray-500">${Object.values(repPipelineDeals).reduce((s, d) => s + (d.count || 0), 0) - (repPipelineDeals['closedlost']?.count || 0) - (repPipelineDeals['decisionmakerboughtin']?.count || 0)} open deals</span>
+        <svg class="chevron w-5 h-5 text-gray-400 transition-transform rotate-90" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+      </div>
+    </button>
+    <!-- Pipeline summary bar (always visible) -->
+    <div class="flex gap-1 h-8 rounded-lg overflow-hidden mb-3">
+      ${STAGES.filter(s => !['closedlost', 'decisionmakerboughtin'].includes(s.id)).map((s, i) => {
+        const stageData = repPipelineDeals[s.id] || { count: 0 };
+        const colors = ['bg-blue-200', 'bg-blue-300', 'bg-blue-400', 'bg-blue-500', 'bg-gray-300', 'bg-gray-200'];
+        return stageData.count > 0 ? `<div class="${colors[i] || 'bg-gray-300'} flex items-center justify-center text-xs font-medium text-gray-700" style="flex:${stageData.count}" title="${s.label}: ${stageData.count}">${stageData.count}</div>` : '';
+      }).join('')}
+    </div>
+    <div id="pipeline-detail" class="hidden">
+      <div class="card p-6">
+        ${STAGES.filter(s => !['closedlost', 'decisionmakerboughtin'].includes(s.id)).map(s => {
+          const stageData = repPipelineDeals[s.id] || { deals: [], count: 0 };
+          if (stageData.count === 0) return '';
+          return `<div class="mb-4 last:mb-0">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-sm font-medium text-gray-700">${s.label}</span>
+              <span class="text-sm text-gray-500">${stageData.count} deal${stageData.count !== 1 ? 's' : ''}</span>
+            </div>
+            <div class="space-y-1.5">
+              ${stageData.deals.map(d => {
+                const health = d.daysSinceMod <= 3 ? 'bg-green-500' : d.daysSinceMod <= 7 ? 'bg-amber-500' : 'bg-red-500';
+                return `<div class="flex items-center gap-3 py-1.5 px-3 bg-gray-50 rounded-lg text-sm">
+                  <span class="health-dot ${health}"></span>
+                  <span class="flex-1 text-gray-700">${escapeHtml(d.name)}</span>
+                  <span class="text-gray-400 text-xs">${d.daysSinceMod}d ago</span>
+                  ${d.value > 0 ? `<span class="text-gray-600 font-medium">$${d.value}</span>` : ''}
+                </div>`;
+              }).join('')}
+            </div>
+          </div>`;
+        }).filter(Boolean).join('<hr class="my-3 border-gray-100">')}
+      </div>
+    </div>
   </div>
 
   <!-- Rep 30-Day Summary -->
