@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 const TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
 if (!TOKEN) { console.error('HUBSPOT_PRIVATE_APP_TOKEN is required'); process.exit(1); }
@@ -11,7 +13,88 @@ const api = axios.create({
 });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const app = express();
+app.use(express.json());
 const PORT = process.env.PORT || 3000;
+
+// ══════════════════════════════════════════
+// TASK STORAGE (file-based, JSON)
+// ══════════════════════════════════════════
+const TASKS_DIR = path.join(__dirname, 'data');
+const TASKS_FILE = path.join(TASKS_DIR, 'tasks.json');
+
+function ensureTasksFile() {
+  if (!fs.existsSync(TASKS_DIR)) fs.mkdirSync(TASKS_DIR, { recursive: true });
+  if (!fs.existsSync(TASKS_FILE)) fs.writeFileSync(TASKS_FILE, '{}');
+}
+
+function readTasks() {
+  ensureTasksFile();
+  try {
+    return JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8'));
+  } catch { return {}; }
+}
+
+function writeTasks(allTasks) {
+  ensureTasksFile();
+  fs.writeFileSync(TASKS_FILE, JSON.stringify(allTasks, null, 2));
+}
+
+function getTodayMelbourne() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' });
+}
+
+function getTasksForDate(dateStr) {
+  const all = readTasks();
+  return all[dateStr] || [];
+}
+
+function saveTasksForDate(dateStr, tasks) {
+  const all = readTasks();
+  all[dateStr] = tasks;
+  const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
+  for (const key of Object.keys(all)) {
+    if (key < cutoff) delete all[key];
+  }
+  writeTasks(all);
+}
+
+function generateTaskId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+function seedDailyTasks(dateStr) {
+  const existing = getTasksForDate(dateStr);
+  if (existing.length > 0) return existing;
+  const tasks = [];
+  const data = cache.data;
+  if (!data) return tasks;
+  if (data.priorities) {
+    for (const p of data.priorities.slice(0, 5)) {
+      tasks.push({
+        id: generateTaskId(),
+        text: p.message,
+        done: false,
+        source: 'auto',
+        severity: p.severity,
+        createdAt: new Date().toISOString(),
+      });
+    }
+  }
+  for (const repName of ACTIVE_REPS) {
+    const target = REP_TARGETS[repName];
+    if (!target) continue;
+    tasks.push({
+      id: generateTaskId(),
+      text: repName.split(' ')[0] + ': Hit ' + target.uniqueCalls + ' unique dials',
+      done: false,
+      source: 'auto',
+      severity: 'info',
+      createdAt: new Date().toISOString(),
+    });
+  }
+  if (tasks.length > 0) saveTasksForDate(dateStr, tasks);
+  return tasks;
+}
 
 // ══════════════════════════════════════════
 // CONFIGURATION
@@ -2882,6 +2965,57 @@ app.get('/api/data', (req, res) => {
 app.get('/api/eb-debug', (req, res) => {
   if (!cache.data || !cache.data.eb) return res.status(503).json({ status: 'no eb data' });
   res.json({ statuses: cache.data.eb.debugStatuses, syncHealthy: cache.data.eb.syncHealthy, campaigns: cache.data.eb.campaignMetrics.length });
+});
+
+// ── Task Checklist API ──
+app.get('/api/tasks/:date', (req, res) => {
+  const dateStr = req.params.date;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return res.status(400).json({ error: 'Invalid date format' });
+  let tasks = getTasksForDate(dateStr);
+  const today = getTodayMelbourne();
+  if (dateStr === today && tasks.length === 0) tasks = seedDailyTasks(dateStr);
+  res.json({ date: dateStr, tasks });
+});
+
+app.post('/api/tasks', (req, res) => {
+  const { date, text } = req.body;
+  if (!date || !text) return res.status(400).json({ error: 'date and text required' });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Invalid date format' });
+  const tasks = getTasksForDate(date);
+  const task = {
+    id: generateTaskId(),
+    text: text.trim(),
+    done: false,
+    source: 'manual',
+    severity: 'info',
+    createdAt: new Date().toISOString(),
+  };
+  tasks.push(task);
+  saveTasksForDate(date, tasks);
+  res.json(task);
+});
+
+app.patch('/api/tasks/:id/toggle', (req, res) => {
+  const { id } = req.params;
+  const date = req.body.date || getTodayMelbourne();
+  const tasks = getTasksForDate(date);
+  const task = tasks.find(t => t.id === id);
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  task.done = !task.done;
+  task.toggledAt = new Date().toISOString();
+  saveTasksForDate(date, tasks);
+  res.json(task);
+});
+
+app.delete('/api/tasks/:id', (req, res) => {
+  const { id } = req.params;
+  const date = req.query.date || getTodayMelbourne();
+  let tasks = getTasksForDate(date);
+  const idx = tasks.findIndex(t => t.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Task not found' });
+  tasks.splice(idx, 1);
+  saveTasksForDate(date, tasks);
+  res.json({ ok: true });
 });
 
 app.get('/refresh', async (req, res) => {
