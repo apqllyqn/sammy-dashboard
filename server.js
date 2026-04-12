@@ -1907,6 +1907,7 @@ function generateHTML(data, { tab = 'today', rep = '', date = '' } = {}) {
   <!-- TODAY / COMMAND CENTER -->
   <div id="tabToday" class="space-y">
     <div id="prioritiesSection"></div>
+    <div id="taskChecklistSection"></div>
     <div id="scorecardSection"></div>
     <div id="drilldownSection" class="hidden"></div>
     <div id="myDaySection"></div>
@@ -2171,6 +2172,7 @@ function renderToday() {
   const dateLabel = formatDateDisplay(selectedDate);
 
   renderScorecard();
+  renderTaskChecklist();
 
   const kpi = selectedRepName ? (dayData.kpis?.[selectedRepName] || null) : null;
 
@@ -2762,6 +2764,90 @@ function renderPriorities() {
   }
   html += '</div>';
   $('prioritiesSection').innerHTML = html;
+}
+
+// ═══ TASK CHECKLIST ═══
+async function loadTasks(dateStr) {
+  try {
+    const resp = await fetch('/api/tasks/' + dateStr);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return data.tasks || [];
+  } catch (e) { return []; }
+}
+
+async function renderTaskChecklist() {
+  const dateStr = selectedDate || TODAY_STR;
+  const isToday = dateStr === TODAY_STR;
+  const tasks = await loadTasks(dateStr);
+  const doneCount = tasks.filter(function(t) { return t.done; }).length;
+  const total = tasks.length;
+  const pctDone = total > 0 ? Math.round((doneCount / total) * 100) : 0;
+  const barColor = pctDone >= 100 ? GREEN : (pctDone >= 50 ? AMBER : RED);
+
+  if (total === 0 && !isToday) {
+    $('taskChecklistSection').innerHTML = '';
+    return;
+  }
+
+  var html = '<div class="card" style="padding:20px;border-left:4px solid ' + BLUE + '">'
+    + '<div class="flex-between" style="margin-bottom:12px">'
+    + '<div><p class="section-title" style="margin-bottom:2px">Daily Checklist</p>'
+    + '<p class="text-xs text-muted">' + doneCount + ' of ' + total + ' complete</p></div>'
+    + '<span class="badge" style="background:' + barColor + '14;color:' + barColor + '">' + pctDone + '%</span></div>'
+    + '<div class="progress" style="margin-bottom:16px;height:6px"><div class="progress-fill" style="width:' + pctDone + '%;background:' + barColor + '"></div></div>';
+
+  html += '<div id="taskList">';
+  for (var i = 0; i < tasks.length; i++) {
+    var t = tasks[i];
+    var checked = t.done ? 'checked' : '';
+    var strikeStyle = t.done ? 'text-decoration:line-through;opacity:0.5;' : '';
+    var sevColor = t.severity === 'critical' ? RED : (t.severity === 'warning' ? AMBER : GRAY);
+    var sourceTag = t.source === 'auto' ? '<span class="text-xs" style="color:' + BLUE + ';margin-left:6px">auto</span>' : '';
+    html += '<label style="display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:0.5px solid var(--border);cursor:pointer;' + strikeStyle + '">'
+      + '<input type="checkbox" ' + checked + ' onchange="toggleTask(\\'' + t.id + '\\',\\'' + dateStr + '\\')" style="margin-top:3px;accent-color:' + sevColor + '">'
+      + '<span class="text-sm" style="flex:1">' + t.text + sourceTag + '</span>'
+      + '<button onclick="event.preventDefault();deleteTask(\\'' + t.id + '\\',\\'' + dateStr + '\\')" class="text-xs" style="color:' + GRAY + ';background:none;border:none;cursor:pointer;padding:2px 6px" title="Remove">&times;</button>'
+      + '</label>';
+  }
+  html += '</div>';
+
+  if (isToday) {
+    html += '<div style="margin-top:12px;display:flex;gap:8px">'
+      + '<input id="newTaskInput" type="text" placeholder="Add a task..." style="flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:13px;outline:none" onkeydown="if(event.key===\\'Enter\\')addTask(\\'' + dateStr + '\\')">'
+      + '<button onclick="addTask(\\'' + dateStr + '\\')" style="padding:8px 16px;background:' + BLUE + ';color:#fff;border:none;border-radius:8px;font-size:13px;cursor:pointer;font-weight:500">Add</button>'
+      + '</div>';
+  }
+
+  html += '</div>';
+  $('taskChecklistSection').innerHTML = html;
+}
+
+async function toggleTask(id, dateStr) {
+  await fetch('/api/tasks/' + id + '/toggle', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ date: dateStr }),
+  });
+  renderTaskChecklist();
+}
+
+async function deleteTask(id, dateStr) {
+  await fetch('/api/tasks/' + id + '?date=' + dateStr, { method: 'DELETE' });
+  renderTaskChecklist();
+}
+
+async function addTask(dateStr) {
+  var input = $('newTaskInput');
+  var text = input.value.trim();
+  if (!text) return;
+  await fetch('/api/tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ date: dateStr, text: text }),
+  });
+  input.value = '';
+  renderTaskChecklist();
 }
 
 // ═══ COMMISSIONS ═══
