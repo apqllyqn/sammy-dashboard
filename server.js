@@ -539,7 +539,7 @@ function computeDayMetrics(dateStr, activity, deals, owners) {
 
 function computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, owners) {
   const channels = {
-    cold_call: { label: 'Cold Call', deals: 0, won: 0, revenue: 0, cost: MONTHLY_COSTS['Cold Email'] || 0 },
+    cold_call: { label: 'Cold Call', deals: 0, won: 0, revenue: 0, cost: (MONTHLY_COSTS['Sales Team'] || 0) + (MONTHLY_COSTS['Aircall'] || 0) },
     cold_email: { label: 'Cold Email', deals: 0, won: 0, revenue: 0, cost: MONTHLY_COSTS['Cold Email'] || 0 },
     inbound: { label: 'Inbound', deals: 0, won: 0, revenue: 0, cost: 0 },
     unknown: { label: 'Unknown', deals: 0, won: 0, revenue: 0, cost: 0 },
@@ -556,9 +556,9 @@ function computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, own
     else if (dealSource === 'inbound_signup' || dealSource === 'referral') channel = 'inbound';
     else if (contactId && contactAnalyticsSources[contactId]) {
       const src = contactAnalyticsSources[contactId].source;
-      if (src === 'OFFLINE_SOURCES') channel = 'cold_call';
+      if (src === 'OFFLINE_SOURCES' || src === 'OFFLINE') channel = 'cold_call';
       else if (src === 'EMAIL_MARKETING') channel = 'cold_email';
-      else if (src === 'ORGANIC_SEARCH' || src === 'DIRECT_TRAFFIC') channel = 'inbound';
+      else if (src === 'ORGANIC_SEARCH' || src === 'DIRECT_TRAFFIC' || src === 'ORGANIC') channel = 'inbound';
     }
 
     if (!channels[channel]) channel = 'unknown';
