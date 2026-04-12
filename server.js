@@ -174,7 +174,7 @@ async function fetchChurnedCustomers() {
   while (true) {
     const body = {
       filterGroups: [{ filters: [{ propertyName: 'user_status', operator: 'EQ', value: 'churned' }] }],
-      properties: ['sammy_subscription_tier', 'createdate', 'firstname', 'lastname'],
+      properties: ['sammy_subscription_tier', 'createdate', 'firstname', 'lastname', 'hs_lastmodifieddate'],
       limit: 100,
     };
     if (after) body.after = after;
@@ -751,16 +751,20 @@ function computeMRRWaterfall(deals, churnedCustomers, paidCustomers) {
     }
   }
 
-  // Churn MRR: churned contacts × their tier pricing
+  // Churn MRR: only contacts who churned in last 30 days
   let churnMRR = 0;
-  const churnCount = churnedCustomers.length;
+  let churnCount = 0;
+  const totalChurnCount = churnedCustomers.length;
   for (const c of churnedCustomers) {
+    const modDate = new Date(c.properties.hs_lastmodifieddate);
+    if (isNaN(modDate) || modDate < thirtyDaysAgo) continue;
     const tier = c.properties.sammy_subscription_tier;
     churnMRR += PRICING[tier] || PRICING.default;
+    churnCount++;
   }
 
   const netMRR = Math.round(newMRR) - Math.round(churnMRR);
-  return { newMRR: Math.round(newMRR), newDeals, churnMRR: Math.round(churnMRR), churnCount, netMRR };
+  return { newMRR: Math.round(newMRR), newDeals, churnMRR: Math.round(churnMRR), churnCount, totalChurnCount, netMRR };
 }
 
 // ── NEW: Week-over-Week Comparison ──
@@ -1511,7 +1515,7 @@ function computeMetrics({ owners, deals: allDeals, dealEmailMap, dealContactIdMa
   }
   // Churn vs new
   if (mrrWaterfall.churnMRR > mrrWaterfall.newMRR && mrrWaterfall.churnCount > 0) {
-    priorities.push({ severity: 'critical', message: 'Churn ($' + mrrWaterfall.churnMRR + ') outpacing new MRR ($' + mrrWaterfall.newMRR + ') — ' + mrrWaterfall.churnCount + ' lost' });
+    priorities.push({ severity: 'critical', message: 'Churn ($' + mrrWaterfall.churnMRR + ') outpacing new MRR ($' + mrrWaterfall.newMRR + ') in 30d — ' + mrrWaterfall.churnCount + ' lost' });
   }
   // Negative ROI
   if (pnl.roi < 0) {
