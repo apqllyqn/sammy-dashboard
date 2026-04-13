@@ -431,14 +431,14 @@ function computeRepStats(deals, owners, activity) {
       const ids = ownerNameToIds[name] || [];
       const repCalls = activity.calls.filter(c => ids.includes(c.properties.hubspot_owner_id));
       const uniqueNumbers = new Set();
-      let totalDuration = 0;
+      let totalDurationMs = 0;
       for (const c of repCalls) {
         if (c.properties.hs_call_to_number) uniqueNumbers.add(c.properties.hs_call_to_number);
-        totalDuration += parseInt(c.properties.hs_call_duration) || 0;
+        totalDurationMs += parseInt(c.properties.hs_call_duration) || 0;
       }
       reps[name].totalCalls30d = repCalls.length;
       reps[name].uniqueNumbers30d = uniqueNumbers.size;
-      reps[name].talkTime30d = totalDuration;
+      reps[name].talkTime30d = Math.round(totalDurationMs / 1000);
     }
   }
 
@@ -464,11 +464,12 @@ function computeDayMetrics(dateStr, activity, deals, owners) {
     });
 
     const uniqueNumbers = new Set();
-    let talkSec = 0;
+    let talkMs = 0;
     for (const c of dayCalls) {
       if (c.properties.hs_call_to_number) uniqueNumbers.add(c.properties.hs_call_to_number);
-      talkSec += parseInt(c.properties.hs_call_duration) || 0;
+      talkMs += parseInt(c.properties.hs_call_duration) || 0;
     }
+    const talkSec = Math.round(talkMs / 1000);
 
     // Week demos (Mon-Sun containing dateStr)
     const d = new Date(dateStr + 'T00:00:00');
