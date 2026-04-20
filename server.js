@@ -29,6 +29,27 @@ function ensureTasksFile() {
 function readTasks() { ensureTasksFile(); try { return JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8')); } catch { return {}; } }
 function writeTasks(all) { ensureTasksFile(); fs.writeFileSync(TASKS_FILE, JSON.stringify(all, null, 2)); }
 function getTodayMelbourne() { return new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' }); }
+
+const RANGES = ['7d', '14d', '30d', '90d', 'mtd', 'qtd', 'ytd'];
+const RANGE_LABELS = { '7d': 'Last 7 days', '14d': 'Last 14 days', '30d': 'Last 30 days', '90d': 'Last 90 days', 'mtd': 'Month to date', 'qtd': 'Quarter to date', 'ytd': 'Year to date' };
+const RANGE_SHORT = { '7d': '7d', '14d': '14d', '30d': '30d', '90d': '90d', 'mtd': 'MTD', 'qtd': 'QTD', 'ytd': 'YTD' };
+
+function getRangeWindow(dateStr, range) {
+  const end = new Date(dateStr + 'T00:00:00');
+  let start;
+  if (range === '7d') { start = new Date(end); start.setDate(end.getDate() - 6); }
+  else if (range === '14d') { start = new Date(end); start.setDate(end.getDate() - 13); }
+  else if (range === '30d') { start = new Date(end); start.setDate(end.getDate() - 29); }
+  else if (range === '90d') { start = new Date(end); start.setDate(end.getDate() - 89); }
+  else if (range === 'mtd') { start = new Date(end.getFullYear(), end.getMonth(), 1); }
+  else if (range === 'qtd') { start = new Date(end.getFullYear(), Math.floor(end.getMonth() / 3) * 3, 1); }
+  else if (range === 'ytd') { start = new Date(end.getFullYear(), 0, 1); }
+  else { start = new Date(end); start.setDate(end.getDate() - 6); }
+  const startStr = start.toISOString().split('T')[0];
+  const endStr = end.toISOString().split('T')[0];
+  const days = Math.round((end - start) / 86400000) + 1;
+  return { startStr, endStr, days, label: RANGE_LABELS[range] || RANGE_LABELS['7d'] };
+}
 function getTasksForDate(dateStr) { return readTasks()[dateStr] || []; }
 function saveTasksForDate(dateStr, tasks) {
   const all = readTasks(); all[dateStr] = tasks;
@@ -445,7 +466,7 @@ function computeRepStats(deals, owners, activity) {
   return reps;
 }
 
-function computeDayMetrics(dateStr, activity, deals, owners) {
+function computeDayMetrics(dateStr, range, activity, deals, owners) {
   const result = {};
   const ownerNameToIds = {};
   for (const [id, name] of Object.entries(owners)) {
@@ -453,54 +474,47 @@ function computeDayMetrics(dateStr, activity, deals, owners) {
     ownerNameToIds[name].push(id);
   }
 
+  const win = getRangeWindow(dateStr, range);
+  const yearStr = dateStr.slice(0, 4);
+
   for (const repName of ACTIVE_REPS) {
     const ids = ownerNameToIds[repName] || [];
-    const dayCalls = (activity.calls || []).filter(c => {
+    const rangeCalls = (activity.calls || []).filter(c => {
       if (!ids.includes(c.properties.hubspot_owner_id)) return false;
       const cd = c.properties.hs_createdate;
       if (!cd) return false;
       const melbDate = new Date(cd).toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' });
-      return melbDate === dateStr;
+      return melbDate >= win.startStr && melbDate <= win.endStr;
     });
 
     const uniqueNumbers = new Set();
     let talkMs = 0;
-    for (const c of dayCalls) {
+    for (const c of rangeCalls) {
       if (c.properties.hs_call_to_number) uniqueNumbers.add(c.properties.hs_call_to_number);
       talkMs += parseInt(c.properties.hs_call_duration) || 0;
     }
     const talkSec = Math.round(talkMs / 1000);
 
-    // Week demos (Mon-Sun containing dateStr)
-    const d = new Date(dateStr + 'T00:00:00');
-    const dayOfWeek = d.getDay() === 0 ? 6 : d.getDay() - 1;
-    const weekStart = new Date(d); weekStart.setDate(d.getDate() - dayOfWeek);
-    const weekEnd = new Date(weekStart); weekEnd.setDate(weekStart.getDate() + 6);
-    const weekStartStr = weekStart.toISOString().split('T')[0];
-    const weekEndStr = weekEnd.toISOString().split('T')[0];
-
-    const weekDemos = deals.filter(deal => {
+    const rangeDemos = deals.filter(deal => {
       if (!ids.includes(deal.properties.hubspot_owner_id)) return false;
       const entered = deal.properties.hs_v2_date_entered_2843565802;
       if (!entered) return false;
       const enteredDate = entered.split('T')[0];
-      return enteredDate >= weekStartStr && enteredDate <= weekEndStr;
+      return enteredDate >= win.startStr && enteredDate <= win.endStr;
     }).length;
 
-    // Month closes
-    const monthStr = dateStr.slice(0, 7);
-    const monthCloses = deals.filter(deal => {
+    const rangeClosesArr = deals.filter(deal => {
       if (!ids.includes(deal.properties.hubspot_owner_id)) return false;
       if (deal.properties.dealstage !== 'decisionmakerboughtin') return false;
       const wonDate = deal.properties.hs_v2_date_entered_decisionmakerboughtin;
-      return wonDate && wonDate.startsWith(monthStr);
+      if (!wonDate) return false;
+      const wd = wonDate.split('T')[0];
+      return wd >= win.startStr && wd <= win.endStr;
     });
-    const monthCloseCount = monthCloses.length;
-    const monthCloseValue = monthCloses.reduce((s, deal) =>
+    const rangeCloses = rangeClosesArr.length;
+    const rangeCloseValue = rangeClosesArr.reduce((s, deal) =>
       s + (parseFloat(deal.properties.amount) || parseFloat(deal.properties.expected_mrr) || 0), 0);
 
-    // YTD closes for commission
-    const yearStr = dateStr.slice(0, 4);
     const ytdCloses = deals.filter(deal => {
       if (!ids.includes(deal.properties.hubspot_owner_id)) return false;
       if (deal.properties.dealstage !== 'decisionmakerboughtin') return false;
@@ -508,33 +522,30 @@ function computeDayMetrics(dateStr, activity, deals, owners) {
       return wonDate && wonDate.startsWith(yearStr);
     });
 
-    // Week closes for commission
-    const weekCloses = deals.filter(deal => {
-      if (!ids.includes(deal.properties.hubspot_owner_id)) return false;
-      if (deal.properties.dealstage !== 'decisionmakerboughtin') return false;
-      const wonDate = deal.properties.hs_v2_date_entered_decisionmakerboughtin;
-      if (!wonDate) return false;
-      const wd = wonDate.split('T')[0];
-      return wd >= weekStartStr && wd <= weekEndStr;
-    });
-
     const target = REP_TARGETS[repName] || {};
+    const dailyDialTarget = target.uniqueCalls || 100;
+    const dailyTalkTarget = target.callHours || 5;
+    const scaledDialTarget = dailyDialTarget * win.days;
+    const scaledTalkTarget = dailyTalkTarget * win.days;
+
     result[repName] = {
-      dials: dayCalls.length,
+      dials: rangeCalls.length,
       uniqueDials: uniqueNumbers.size,
       talkTimeSec: talkSec,
       talkTimeMin: Math.round(talkSec / 60),
       talkTimeHrs: (talkSec / 3600).toFixed(1),
-      dialTarget: target.uniqueCalls || 100,
-      talkTarget: target.callHours || 5,
-      dialPct: Math.min(100, Math.round((uniqueNumbers.size / (target.uniqueCalls || 100)) * 100)),
-      talkPct: Math.min(100, Math.round(((talkSec / 3600) / (target.callHours || 5)) * 100)),
-      weekDemos,
-      monthCloses: monthCloseCount,
-      monthCloseValue,
-      commissionMonth: monthCloseCount * COMMISSION_PER_CLOSE,
-      commissionWeek: weekCloses.length * COMMISSION_PER_CLOSE,
+      dialTarget: scaledDialTarget,
+      talkTarget: scaledTalkTarget,
+      dialPct: Math.min(100, Math.round((uniqueNumbers.size / scaledDialTarget) * 100)),
+      talkPct: Math.min(100, Math.round(((talkSec / 3600) / scaledTalkTarget) * 100)),
+      demos: rangeDemos,
+      closes: rangeCloses,
+      closeValue: rangeCloseValue,
+      commission: rangeCloses * COMMISSION_PER_CLOSE,
       commissionYTD: ytdCloses.length * COMMISSION_PER_CLOSE,
+      rangeLabel: win.label,
+      rangeShort: RANGE_SHORT[range] || range,
+      rangeDays: win.days,
     };
   }
   return result;
@@ -623,7 +634,11 @@ function computeMetrics(raw) {
   const forecast = computeWeightedForecast(pipeline);
   const repStats = computeRepStats(deals, owners, activity);
   const today = getTodayMelbourne();
-  const dayMetrics = computeDayMetrics(today, activity, deals, owners);
+  const dayMetricsByRange = {};
+  for (const r of RANGES) {
+    dayMetricsByRange[r] = computeDayMetrics(today, r, activity, deals, owners);
+  }
+  const dayMetrics = dayMetricsByRange['7d'];
   const channels = computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, owners);
   const pnl = computePnL(mrr, churn);
   const instantlyMetrics = computeInstantlyMetrics(instantly);
@@ -673,7 +688,7 @@ function computeMetrics(raw) {
   }
 
   return {
-    mrr, churn, pipeline, forecast, repStats, dayMetrics, channels, pnl,
+    mrr, churn, pipeline, forecast, repStats, dayMetrics, dayMetricsByRange, channels, pnl,
     instantly: instantlyMetrics,
     funnel, winRate, ltvCac, ltv: Math.round(ltv), cac: Math.round(cac),
     insights, owners,
@@ -775,10 +790,12 @@ function seedDailyTasks(dateStr, data, repName) {
 // ══════════════════════════════════════════
 // HTML GENERATION
 // ══════════════════════════════════════════
-function generateHTML(data, { view = 'rep', rep = '', date = '' } = {}) {
+function generateHTML(data, { view = 'rep', rep = '', date = '', range = '7d' } = {}) {
   const today = date || data.today || getTodayMelbourne();
   const selectedRep = rep || ACTIVE_REPS[0];
-  const dm = data.dayMetrics || {};
+  const selectedRange = RANGES.includes(range) ? range : '7d';
+  const dmByRange = data.dayMetricsByRange || {};
+  const dm = dmByRange[selectedRange] || data.dayMetrics || {};
   const repDay = dm[selectedRep] || {};
   const repStat = (data.repStats || {})[selectedRep] || {};
   const tasks = seedDailyTasks(today, data, selectedRep);
@@ -848,6 +865,9 @@ function generateHTML(data, { view = 'rep', rep = '', date = '' } = {}) {
       <select id="rep-select" onchange="changeRep(this.value)" class="text-sm border border-gray-200 rounded-lg px-3 py-1.5 bg-white">
         ${ACTIVE_REPS.map(r => `<option value="${r}" ${r === selectedRep ? 'selected' : ''}>${r}</option>`).join('')}
       </select>
+      <select id="range-select" onchange="changeRange(this.value)" class="text-sm border border-gray-200 rounded-lg px-3 py-1.5 bg-white">
+        ${RANGES.map(r => `<option value="${r}" ${r === selectedRange ? 'selected' : ''}>${RANGE_LABELS[r]}</option>`).join('')}
+      </select>
       <input type="date" id="date-picker" value="${today}" onchange="changeDate(this.value)" class="text-sm border border-gray-200 rounded-lg px-3 py-1.5 bg-white" />
       <a href="/refresh" class="text-sm text-blue-600 hover:text-blue-800 font-medium">Refresh</a>
       <span class="text-xs text-gray-400">${new Date(data.lastRefreshed).toLocaleTimeString('en-AU', { timeZone: 'Australia/Melbourne', hour: '2-digit', minute: '2-digit' })} AEST</span>
@@ -896,20 +916,23 @@ function generateHTML(data, { view = 'rep', rep = '', date = '' } = {}) {
   </div>
 
   <!-- My Numbers -->
-  <h2 class="text-lg font-semibold text-gray-900 mb-3">My Numbers</h2>
+  <div class="flex items-baseline justify-between mb-3">
+    <h2 class="text-lg font-semibold text-gray-900">My Numbers</h2>
+    <span class="text-xs text-gray-500">${repDay.rangeLabel || 'Last 7 days'}</span>
+  </div>
   <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6 kpi-grid" style="grid-template-columns: repeat(5, 1fr);">
     <!-- Dials -->
     <div class="kpi-card">
-      <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Unique Dials</div>
+      <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Unique Dials (${repDay.rangeShort || '7d'})</div>
       <div class="text-2xl font-bold text-gray-900">${repDay.uniqueDials || 0}</div>
-      <div class="text-xs text-gray-500 mb-2">of ${repDay.dialTarget || 100} target</div>
+      <div class="text-xs text-gray-500 mb-2">of ${(repDay.dialTarget || 100).toLocaleString()} target</div>
       <div class="progress-bar">
         <div class="progress-fill ${(repDay.dialPct || 0) >= 100 ? 'bg-green-500' : (repDay.dialPct || 0) >= 50 ? 'bg-blue-500' : 'bg-amber-500'}" style="width:${repDay.dialPct || 0}%"></div>
       </div>
     </div>
     <!-- Talk Time -->
     <div class="kpi-card">
-      <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Talk Time</div>
+      <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Talk Time (${repDay.rangeShort || '7d'})</div>
       <div class="text-2xl font-bold text-gray-900">${repDay.talkTimeHrs || '0.0'}h</div>
       <div class="text-xs text-gray-500 mb-2">of ${repDay.talkTarget || 5}h target</div>
       <div class="progress-bar">
@@ -918,34 +941,37 @@ function generateHTML(data, { view = 'rep', rep = '', date = '' } = {}) {
     </div>
     <!-- Demos -->
     <div class="kpi-card">
-      <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Demos This Week</div>
-      <div class="text-2xl font-bold text-gray-900">${repDay.weekDemos || 0}</div>
+      <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Demos (${repDay.rangeShort || '7d'})</div>
+      <div class="text-2xl font-bold text-gray-900">${repDay.demos || 0}</div>
       <div class="text-xs text-gray-500">booked</div>
     </div>
     <!-- Closes -->
     <div class="kpi-card">
-      <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Closes This Month</div>
-      <div class="text-2xl font-bold text-green-600">${repDay.monthCloses || 0}</div>
-      <div class="text-xs text-gray-500">$${(repDay.monthCloseValue || 0).toLocaleString()} value</div>
+      <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Closes (${repDay.rangeShort || '7d'})</div>
+      <div class="text-2xl font-bold text-green-600">${repDay.closes || 0}</div>
+      <div class="text-xs text-gray-500">$${(repDay.closeValue || 0).toLocaleString()} value</div>
     </div>
     <!-- Commission -->
     <div class="kpi-card">
-      <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Commission YTD</div>
-      <div class="text-2xl font-bold text-purple-600">$${(repDay.commissionYTD || 0).toLocaleString()}</div>
-      <div class="text-xs text-gray-500">$${(repDay.commissionMonth || 0).toLocaleString()} this month</div>
+      <div class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Commission (${repDay.rangeShort || '7d'})</div>
+      <div class="text-2xl font-bold text-purple-600">$${(repDay.commission || 0).toLocaleString()}</div>
+      <div class="text-xs text-gray-500">$${(repDay.commissionYTD || 0).toLocaleString()} YTD</div>
     </div>
   </div>
 
-  <!-- Daily Activity -->
-  <h2 class="text-lg font-semibold text-gray-900 mb-3">Today's Activity</h2>
+  <!-- Activity -->
+  <div class="flex items-baseline justify-between mb-3">
+    <h2 class="text-lg font-semibold text-gray-900">Activity</h2>
+    <span class="text-xs text-gray-500">${repDay.rangeLabel || 'Last 7 days'}</span>
+  </div>
   <div class="grid grid-cols-3 gap-4 mb-6">
     <div class="card p-4 text-center">
       <div class="text-3xl font-bold text-blue-600" id="act-calls">${repDay.dials || 0}</div>
       <div class="text-xs text-gray-500 mt-1">Calls</div>
     </div>
     <div class="card p-4 text-center">
-      <div class="text-3xl font-bold text-green-600" id="act-meetings">${repDay.weekDemos || 0}</div>
-      <div class="text-xs text-gray-500 mt-1">Demos/Week</div>
+      <div class="text-3xl font-bold text-green-600" id="act-meetings">${repDay.demos || 0}</div>
+      <div class="text-xs text-gray-500 mt-1">Demos</div>
     </div>
     <div class="card p-4 text-center">
       <div class="text-3xl font-bold text-purple-600" id="act-talktime">${repDay.talkTimeHrs || '0.0'}h</div>
@@ -1306,6 +1332,12 @@ function changeDate(d) {
   window.location = url;
 }
 
+function changeRange(r) {
+  const url = new URL(window.location);
+  url.searchParams.set('range', r);
+  window.location = url;
+}
+
 async function toggleTask(id) {
   try {
     const res = await fetch('/api/tasks/' + id + '/toggle', { method: 'PATCH' });
@@ -1450,7 +1482,8 @@ app.get('/', async (req, res) => {
     const view = req.query.view || 'rep';
     const rep = req.query.rep || '';
     const date = req.query.date || '';
-    res.type('html').send(generateHTML(cache.data, { view, rep, date }));
+    const range = req.query.range || '7d';
+    res.type('html').send(generateHTML(cache.data, { view, rep, date, range }));
   } else {
     res.type('html').send(loadingHTML());
   }
