@@ -30,21 +30,22 @@ function readTasks() { ensureTasksFile(); try { return JSON.parse(fs.readFileSyn
 function writeTasks(all) { ensureTasksFile(); fs.writeFileSync(TASKS_FILE, JSON.stringify(all, null, 2)); }
 function getTodayMelbourne() { return new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' }); }
 
-const RANGES = ['7d', '14d', '30d', '90d', 'mtd', 'qtd', 'ytd'];
-const RANGE_LABELS = { '7d': 'Last 7 days', '14d': 'Last 14 days', '30d': 'Last 30 days', '90d': 'Last 90 days', 'mtd': 'Month to date', 'qtd': 'Quarter to date', 'ytd': 'Year to date' };
-const RANGE_SHORT = { '7d': '7d', '14d': '14d', '30d': '30d', '90d': '90d', 'mtd': 'MTD', 'qtd': 'QTD', 'ytd': 'YTD' };
+const RANGES = ['today', '7d', '14d', '30d', '90d', 'mtd', 'qtd', 'ytd'];
+const RANGE_LABELS = { 'today': 'Today', '7d': 'Last 7 days', '14d': 'Last 14 days', '30d': 'Last 30 days', '90d': 'Last 90 days', 'mtd': 'Month to date', 'qtd': 'Quarter to date', 'ytd': 'Year to date' };
+const RANGE_SHORT = { 'today': 'Today', '7d': '7d', '14d': '14d', '30d': '30d', '90d': '90d', 'mtd': 'MTD', 'qtd': 'QTD', 'ytd': 'YTD' };
 
 function getRangeWindow(dateStr, range) {
   const end = new Date(dateStr + 'T00:00:00');
   let start;
-  if (range === '7d') { start = new Date(end); start.setDate(end.getDate() - 6); }
+  if (range === 'today') { start = new Date(end); }
+  else if (range === '7d') { start = new Date(end); start.setDate(end.getDate() - 6); }
   else if (range === '14d') { start = new Date(end); start.setDate(end.getDate() - 13); }
   else if (range === '30d') { start = new Date(end); start.setDate(end.getDate() - 29); }
   else if (range === '90d') { start = new Date(end); start.setDate(end.getDate() - 89); }
   else if (range === 'mtd') { start = new Date(end.getFullYear(), end.getMonth(), 1); }
   else if (range === 'qtd') { start = new Date(end.getFullYear(), Math.floor(end.getMonth() / 3) * 3, 1); }
   else if (range === 'ytd') { start = new Date(end.getFullYear(), 0, 1); }
-  else { start = new Date(end); start.setDate(end.getDate() - 6); }
+  else { start = new Date(end); }
   const startStr = start.toISOString().split('T')[0];
   const endStr = end.toISOString().split('T')[0];
   const days = Math.round((end - start) / 86400000) + 1;
@@ -638,7 +639,7 @@ function computeMetrics(raw) {
   for (const r of RANGES) {
     dayMetricsByRange[r] = computeDayMetrics(today, r, activity, deals, owners);
   }
-  const dayMetrics = dayMetricsByRange['7d'];
+  const dayMetrics = dayMetricsByRange['today'];
   const channels = computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, owners);
   const pnl = computePnL(mrr, churn);
   const instantlyMetrics = computeInstantlyMetrics(instantly);
@@ -790,10 +791,10 @@ function seedDailyTasks(dateStr, data, repName) {
 // ══════════════════════════════════════════
 // HTML GENERATION
 // ══════════════════════════════════════════
-function generateHTML(data, { view = 'rep', rep = '', date = '', range = '7d' } = {}) {
+function generateHTML(data, { view = 'rep', rep = '', date = '', range = 'today' } = {}) {
   const today = date || data.today || getTodayMelbourne();
   const selectedRep = rep || ACTIVE_REPS[0];
-  const selectedRange = RANGES.includes(range) ? range : '7d';
+  const selectedRange = RANGES.includes(range) ? range : 'today';
   const dmByRange = data.dayMetricsByRange || {};
   const dm = dmByRange[selectedRange] || data.dayMetrics || {};
   const repDay = dm[selectedRep] || {};
@@ -1482,7 +1483,7 @@ app.get('/', async (req, res) => {
     const view = req.query.view || 'rep';
     const rep = req.query.rep || '';
     const date = req.query.date || '';
-    const range = req.query.range || '7d';
+    const range = req.query.range || 'today';
     res.type('html').send(generateHTML(cache.data, { view, rep, date, range }));
   } else {
     res.type('html').send(loadingHTML());
