@@ -79,7 +79,7 @@ const STAGES = [
   { id: 'decisionmakerboughtin', label: 'Closed Won', weight: 1.00 },
 ];
 
-const MONTHLY_COSTS = { 'Cold Email': 1000, 'Sales Team': 4000, 'HubSpot': 50, 'Aircall': 100, 'Paid Ads': 0, 'LinkedIn Automation': 0 };
+const MONTHLY_COSTS = { 'Cold Email': 1000, 'Sales Team': 4000, 'HubSpot': 50, 'Aircall': 100, 'Paid Ads': 1500, 'LinkedIn Automation': 100 };
 
 const ACTIVE_REPS = ['Lucas Gibson', 'Krishna Pryor'];
 const REP_TARGETS = {
@@ -165,7 +165,7 @@ async function fetchContactEmails(contactIds) {
     try {
       const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/batch/read', {
         inputs: batch.map(id => ({ id })),
-        properties: ['email', 'hs_analytics_source', 'hs_analytics_source_data_1', 'original_source_channel', 'latest_source_channel'],
+        properties: ['email', 'hs_analytics_source', 'hs_analytics_source_data_1', 'original_source_channel', 'latest_source_channel', 'sammy_utm_source', 'sammy_utm_medium', 'sammy_utm_campaign'],
       }));
       for (const c of data.results) {
         if (c.properties.email) emailMap[c.id] = c.properties.email.toLowerCase();
@@ -173,10 +173,15 @@ async function fetchContactEmails(contactIds) {
           source: c.properties.hs_analytics_source,
           sourceData: c.properties.hs_analytics_source_data_1 || '',
         };
-        if (c.properties.original_source_channel || c.properties.latest_source_channel) {
+        if (c.properties.original_source_channel || c.properties.latest_source_channel || c.properties.sammy_utm_medium) {
           channelMap[c.id] = {
             original: c.properties.original_source_channel || null,
             latest: c.properties.latest_source_channel || null,
+            utm: c.properties.sammy_utm_medium ? {
+              source: c.properties.sammy_utm_source,
+              medium: c.properties.sammy_utm_medium,
+              campaign: c.properties.sammy_utm_campaign,
+            } : null,
           };
         }
       }
@@ -588,6 +593,20 @@ function computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, con
     return null;
   };
 
+  // Local UTM-to-channel helper (mirrors deriveChannelFromUTM in the webhook section)
+  const channelFromUtm = (utm) => {
+    if (!utm || !utm.medium) return null;
+    const m = String(utm.medium).toLowerCase();
+    const s = String(utm.source || '').toLowerCase();
+    if (m === 'email') return 'cold_email';
+    if (['cpc', 'cpm', 'ppc', 'paid'].includes(m)) return 'paid_ads';
+    if (m === 'social' && ['facebook', 'meta', 'instagram', 'google', 'linkedin_ads', 'tiktok'].includes(s)) return 'paid_ads';
+    if (s === 'linkedin' && m !== 'social') return 'linkedin_automation';
+    if (m === 'organic') return 'organic_inbound';
+    if (m === 'referral') return 'referral';
+    return null;
+  };
+
   for (const d of deals) {
     const contactId = dealContactIdMap[d.id];
     let channel = null;
@@ -596,9 +615,13 @@ function computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, con
     if (contactId && contactChannels && contactChannels[contactId]?.original) {
       channel = contactChannels[contactId].original;
     }
-    // 2. Deal's deal_source — for deals manually classified by reps
+    // 2. Sammy UTM data pushed by Accounts Sync (when present)
+    if (!channel && contactId && contactChannels?.[contactId]?.utm) {
+      channel = channelFromUtm(contactChannels[contactId].utm);
+    }
+    // 3. Deal's deal_source — for deals manually classified by reps
     if (!channel) channel = mapDealSource(d.properties.deal_source);
-    // 3. Contact's analytics source — final fallback
+    // 4. Contact's analytics source — final fallback
     if (!channel && contactId && contactAnalyticsSources[contactId]) {
       channel = mapAnalyticsSource(contactAnalyticsSources[contactId].source);
     }
@@ -1522,19 +1545,32 @@ const VALID_CHANNELS = new Set([
   'organic_inbound', 'user_generated', 'referral',
 ]);
 
+// UTM-to-channel mapping aligned with the Sammy UTM conventions doc.
+// Sammy convention: utm_medium=email always means a Sammy email program (newsletter,
+// lifecycle, sales, partner, webinar, transactional). All map to cold_email here.
+// Paid mediums (cpc/ppc/cpm/social-with-paid-source) → paid_ads.
 function deriveChannelFromUTM(utm) {
   if (!utm || typeof utm !== 'object') return null;
   const source = (utm.source || '').toLowerCase();
   const medium = (utm.medium || '').toLowerCase();
-  // Paid: any CPC/CPM medium or known paid source
-  if (medium === 'cpc' || medium === 'cpm' || medium === 'paid' || medium === 'ppc') return 'paid_ads';
-  if (['facebook', 'meta', 'instagram', 'google', 'linkedin_ads', 'tiktok'].includes(source) && medium === 'social') return 'paid_ads';
-  if (source === 'google' && (medium === 'organic' || !medium)) return 'organic_inbound';
-  if (medium === 'organic') return 'organic_inbound';
-  if (medium === 'referral') return 'referral';
-  if (medium === 'email' || source === 'instantly' || source === 'mailchimp') return 'cold_email';
+
+  // Email — always cold_email per Sammy convention (medium is always 'email' for email)
+  if (medium === 'email') return 'cold_email';
+
+  // Paid mediums
+  if (['cpc', 'cpm', 'ppc', 'paid'].includes(medium)) return 'paid_ads';
+  if (medium === 'social' && ['facebook', 'meta', 'instagram', 'google', 'linkedin_ads', 'tiktok'].includes(source)) return 'paid_ads';
+
+  // LinkedIn automation — non-paid LinkedIn touch
   if (source === 'linkedin' && medium !== 'social') return 'linkedin_automation';
-  // If any UTMs present but unrecognized — treat as paid_ads (utms usually mean campaigns)
+
+  // Organic
+  if (medium === 'organic' || (source === 'google' && !medium)) return 'organic_inbound';
+  if (medium === 'referral') return 'referral';
+
+  // Known cold-email tool sources without medium (fallback)
+  if (['instantly', 'mailchimp', 'klaviyo'].includes(source)) return 'cold_email';
+
   return null;
 }
 
@@ -1607,6 +1643,14 @@ async function writeChannel(email, channel, utm) {
   const utmStr = utm ? [utm.source, utm.medium, utm.campaign].filter(Boolean).join('|') : null;
   const existing = await findContactByEmail(email);
   const props = { latest_source_channel: channel };
+  // Write individual sammy_utm_* fields (write-once each) if UTMs provided
+  if (utm) {
+    if (utm.source && (!existing || !existing.properties.sammy_utm_source))     props.sammy_utm_source = String(utm.source).toLowerCase();
+    if (utm.medium && (!existing || !existing.properties.sammy_utm_medium))     props.sammy_utm_medium = String(utm.medium).toLowerCase();
+    if (utm.campaign && (!existing || !existing.properties.sammy_utm_campaign)) props.sammy_utm_campaign = String(utm.campaign).toLowerCase();
+    if (utm.content && (!existing || !existing.properties.sammy_utm_content))   props.sammy_utm_content = String(utm.content).toLowerCase();
+    if (utm.term && (!existing || !existing.properties.sammy_utm_term))         props.sammy_utm_term = String(utm.term).toLowerCase();
+  }
   if (existing) {
     if (!existing.properties.original_source_channel) props.original_source_channel = channel;
     if (utmStr && !existing.properties.first_utm) props.first_utm = utmStr;
