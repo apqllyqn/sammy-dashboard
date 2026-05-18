@@ -1584,6 +1584,95 @@ app.post('/webhook/source', async (req, res) => {
   }
 });
 
+// ──────────────────────────────────────────
+// Provider adapter routes — accept native payloads from common tools.
+// Auth via ?secret=XXX query param (since most tools can't set custom headers).
+// ──────────────────────────────────────────
+
+function extractEmailFromAny(body) {
+  if (!body || typeof body !== 'object') return null;
+  // Try common email field locations in order
+  const paths = [
+    body.email, body.lead_email, body.contact_email,
+    body.lead?.email, body.contact?.email, body.data?.email,
+    body.payload?.email, body.lead?.lead_email,
+  ];
+  for (const v of paths) {
+    if (v && typeof v === 'string' && v.includes('@')) return v.toLowerCase();
+  }
+  return null;
+}
+
+async function writeChannel(email, channel, utm) {
+  const utmStr = utm ? [utm.source, utm.medium, utm.campaign].filter(Boolean).join('|') : null;
+  const existing = await findContactByEmail(email);
+  const props = { latest_source_channel: channel };
+  if (existing) {
+    if (!existing.properties.original_source_channel) props.original_source_channel = channel;
+    if (utmStr && !existing.properties.first_utm) props.first_utm = utmStr;
+    await api.patch(`/crm/v3/objects/contacts/${existing.id}`, { properties: props });
+    return { contactId: existing.id, action: 'updated', wrote: props };
+  } else {
+    props.original_source_channel = channel;
+    if (utmStr) props.first_utm = utmStr;
+    const { data } = await api.post('/crm/v3/objects/contacts', { properties: { email, ...props } });
+    return { contactId: data.id, action: 'created', wrote: props };
+  }
+}
+
+// Instantly: any reply, email_sent, or lead_interested event → cold_email
+app.post('/webhook/instantly', async (req, res) => {
+  if ((req.query.secret || '') !== (process.env.WEBHOOK_SECRET || '___unset___')) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const email = extractEmailFromAny(req.body);
+  if (!email) return res.status(400).json({ error: 'could not extract email from payload', payload: req.body });
+  try {
+    const result = await writeChannel(email, 'cold_email', null);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('[webhook/instantly]', email, err.response?.data?.message || err.message);
+    res.status(500).json({ error: 'hubspot write failed' });
+  }
+});
+
+// Aircall: call.created or call.ended event → cold_call
+app.post('/webhook/aircall', async (req, res) => {
+  if ((req.query.secret || '') !== (process.env.WEBHOOK_SECRET || '___unset___')) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  // Aircall sends nested contact info; try both contact.email and data.contact.email
+  const body = req.body || {};
+  const email = body.data?.contact?.email || body.contact?.email || extractEmailFromAny(body);
+  if (!email) return res.status(400).json({ error: 'could not extract email from payload' });
+  try {
+    const result = await writeChannel(email, 'cold_call', null);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('[webhook/aircall]', email, err.response?.data?.message || err.message);
+    res.status(500).json({ error: 'hubspot write failed' });
+  }
+});
+
+// Sammy app signup form: POST with email + UTMs at signup time
+// channel auto-derives from UTMs; defaults to organic_inbound if no UTMs.
+app.post('/webhook/signup', async (req, res) => {
+  if ((req.query.secret || '') !== (process.env.WEBHOOK_SECRET || '___unset___')) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const email = extractEmailFromAny(req.body);
+  if (!email) return res.status(400).json({ error: 'email required' });
+  const utm = req.body.utm || (req.body.utm_source ? { source: req.body.utm_source, medium: req.body.utm_medium, campaign: req.body.utm_campaign } : null);
+  const channel = deriveChannelFromUTM(utm) || 'organic_inbound';
+  try {
+    const result = await writeChannel(email, channel, utm);
+    res.json({ ok: true, channel, ...result });
+  } catch (err) {
+    console.error('[webhook/signup]', email, err.response?.data?.message || err.message);
+    res.status(500).json({ error: 'hubspot write failed' });
+  }
+});
+
 app.get('/refresh', async (req, res) => {
   cache.time = 0;
   refreshCache();
