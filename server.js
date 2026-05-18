@@ -79,7 +79,7 @@ const STAGES = [
   { id: 'decisionmakerboughtin', label: 'Closed Won', weight: 1.00 },
 ];
 
-const MONTHLY_COSTS = { 'Cold Email': 1000, 'Sales Team': 4000, 'HubSpot': 50, 'Aircall': 100 };
+const MONTHLY_COSTS = { 'Cold Email': 1000, 'Sales Team': 4000, 'HubSpot': 50, 'Aircall': 100, 'Paid Ads': 0, 'LinkedIn Automation': 0 };
 
 const ACTIVE_REPS = ['Lucas Gibson', 'Krishna Pryor'];
 const REP_TARGETS = {
@@ -159,12 +159,13 @@ async function fetchAllDeals() {
 async function fetchContactEmails(contactIds) {
   const emailMap = {};
   const analyticsSourceMap = {};
+  const channelMap = {};
   for (let i = 0; i < contactIds.length; i += 100) {
     const batch = contactIds.slice(i, i + 100);
     try {
       const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/batch/read', {
         inputs: batch.map(id => ({ id })),
-        properties: ['email', 'hs_analytics_source', 'hs_analytics_source_data_1'],
+        properties: ['email', 'hs_analytics_source', 'hs_analytics_source_data_1', 'original_source_channel', 'latest_source_channel'],
       }));
       for (const c of data.results) {
         if (c.properties.email) emailMap[c.id] = c.properties.email.toLowerCase();
@@ -172,13 +173,19 @@ async function fetchContactEmails(contactIds) {
           source: c.properties.hs_analytics_source,
           sourceData: c.properties.hs_analytics_source_data_1 || '',
         };
+        if (c.properties.original_source_channel || c.properties.latest_source_channel) {
+          channelMap[c.id] = {
+            original: c.properties.original_source_channel || null,
+            latest: c.properties.latest_source_channel || null,
+          };
+        }
       }
     } catch (err) {
       console.error('[fetch] Contact batch read failed:', err.response?.data?.message || err.message);
     }
     if (i + 100 < contactIds.length) await sleep(300);
   }
-  return { emailMap, analyticsSourceMap };
+  return { emailMap, analyticsSourceMap, channelMap };
 }
 
 async function fetchPaidCustomers() {
@@ -300,7 +307,7 @@ async function fetchAllData() {
     const assoc = d.associations?.contacts?.results;
     if (assoc) for (const c of assoc) contactIds.add(c.id);
   }
-  const { emailMap: contactEmails, analyticsSourceMap: contactAnalyticsSources } = await fetchContactEmails([...contactIds]);
+  const { emailMap: contactEmails, analyticsSourceMap: contactAnalyticsSources, channelMap: contactChannels } = await fetchContactEmails([...contactIds]);
 
   const dealEmailMap = {}, dealContactIdMap = {};
   for (const d of deals) {
@@ -331,7 +338,7 @@ async function fetchAllData() {
   console.log(`[fetch] Done in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${deals.length} deals, ${paid} paid, ${instantlyCampaigns.length} campaigns`);
 
   return {
-    owners, deals, dealEmailMap, dealContactIdMap, contactAnalyticsSources,
+    owners, deals, dealEmailMap, dealContactIdMap, contactAnalyticsSources, contactChannels,
     funnel: { noStatus, incomplete, activeTrial, paid, expired, churned },
     paidCustomers, churnedCustomers, activeTrials,
     activity: { calls: calls || [], meetings: meetings || [], notes: notes || [] },
@@ -552,31 +559,51 @@ function computeDayMetrics(dateStr, range, activity, deals, owners) {
   return result;
 }
 
-function computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, owners) {
+// 7-channel attribution model. Priority: contact original_source_channel > deal_source > hs_analytics_source.
+function computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, contactChannels, owners) {
   const channels = {
-    cold_call: { label: 'Cold Call', deals: 0, won: 0, revenue: 0, cost: (MONTHLY_COSTS['Sales Team'] || 0) + (MONTHLY_COSTS['Aircall'] || 0) },
-    cold_email: { label: 'Cold Email', deals: 0, won: 0, revenue: 0, cost: MONTHLY_COSTS['Cold Email'] || 0 },
-    inbound: { label: 'Inbound', deals: 0, won: 0, revenue: 0, cost: 0 },
-    unknown: { label: 'Unknown', deals: 0, won: 0, revenue: 0, cost: 0 },
+    cold_call:           { label: 'Cold Call',           deals: 0, won: 0, revenue: 0, cost: (MONTHLY_COSTS['Sales Team'] || 0) + (MONTHLY_COSTS['Aircall'] || 0) },
+    cold_email:          { label: 'Cold Email',          deals: 0, won: 0, revenue: 0, cost: MONTHLY_COSTS['Cold Email'] || 0 },
+    linkedin_automation: { label: 'LinkedIn Automation', deals: 0, won: 0, revenue: 0, cost: MONTHLY_COSTS['LinkedIn Automation'] || 0 },
+    paid_ads:            { label: 'Paid Ads',            deals: 0, won: 0, revenue: 0, cost: MONTHLY_COSTS['Paid Ads'] || 0 },
+    organic_inbound:     { label: 'Organic Inbound',     deals: 0, won: 0, revenue: 0, cost: 0 },
+    user_generated:      { label: 'User Generated',      deals: 0, won: 0, revenue: 0, cost: 0 },
+    referral:            { label: 'Referral',            deals: 0, won: 0, revenue: 0, cost: 0 },
+    unknown:             { label: 'Unknown',             deals: 0, won: 0, revenue: 0, cost: 0 },
+  };
+
+  // Map legacy deal_source values into the 7-channel taxonomy
+  const mapDealSource = (v) => {
+    if (!v) return null;
+    if (v === 'inbound_signup') return 'organic_inbound';
+    return v;
+  };
+  const mapAnalyticsSource = (src) => {
+    if (!src) return null;
+    if (src === 'PAID_SOCIAL' || src === 'PAID_SEARCH') return 'paid_ads';
+    if (src === 'REFERRALS') return 'referral';
+    if (src === 'EMAIL_MARKETING') return 'cold_email';
+    if (src === 'ORGANIC_SEARCH' || src === 'DIRECT_TRAFFIC' || src === 'SOCIAL_MEDIA') return 'organic_inbound';
+    if (src === 'OFFLINE_SOURCES' || src === 'OFFLINE') return null; // too noisy to trust
+    return null;
   };
 
   for (const d of deals) {
     const contactId = dealContactIdMap[d.id];
-    let channel = 'unknown';
+    let channel = null;
 
-    // First try deal_source property
-    const dealSource = d.properties.deal_source;
-    if (dealSource === 'cold_call') channel = 'cold_call';
-    else if (dealSource === 'cold_email') channel = 'cold_email';
-    else if (dealSource === 'inbound_signup' || dealSource === 'referral') channel = 'inbound';
-    else if (contactId && contactAnalyticsSources[contactId]) {
-      const src = contactAnalyticsSources[contactId].source;
-      if (src === 'OFFLINE_SOURCES' || src === 'OFFLINE') channel = 'cold_call';
-      else if (src === 'EMAIL_MARKETING') channel = 'cold_email';
-      else if (src === 'ORGANIC_SEARCH' || src === 'DIRECT_TRAFFIC' || src === 'ORGANIC') channel = 'inbound';
+    // 1. Contact's original_source_channel — set by backfill + webhooks. Highest trust.
+    if (contactId && contactChannels && contactChannels[contactId]?.original) {
+      channel = contactChannels[contactId].original;
+    }
+    // 2. Deal's deal_source — for deals manually classified by reps
+    if (!channel) channel = mapDealSource(d.properties.deal_source);
+    // 3. Contact's analytics source — final fallback
+    if (!channel && contactId && contactAnalyticsSources[contactId]) {
+      channel = mapAnalyticsSource(contactAnalyticsSources[contactId].source);
     }
 
-    if (!channels[channel]) channel = 'unknown';
+    if (!channel || !channels[channel]) channel = 'unknown';
     channels[channel].deals++;
     const val = parseFloat(d.properties.amount) || parseFloat(d.properties.expected_mrr) || 0;
     if (d.properties.dealstage === 'decisionmakerboughtin') {
@@ -585,7 +612,6 @@ function computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, own
     }
   }
 
-  // Compute ROI
   for (const ch of Object.values(channels)) {
     ch.roi = ch.cost > 0 ? ((ch.revenue - ch.cost) / ch.cost * 100).toFixed(0) : 'N/A';
     ch.winRate = ch.deals > 0 ? ((ch.won / ch.deals) * 100).toFixed(0) : '0';
@@ -626,7 +652,7 @@ function computeInstantlyMetrics(instantly) {
 }
 
 function computeMetrics(raw) {
-  const { owners, deals, dealEmailMap, dealContactIdMap, contactAnalyticsSources,
+  const { owners, deals, dealEmailMap, dealContactIdMap, contactAnalyticsSources, contactChannels,
     funnel, paidCustomers, churnedCustomers, activeTrials, activity, instantly } = raw;
 
   const mrr = computeMRR(paidCustomers);
@@ -640,7 +666,7 @@ function computeMetrics(raw) {
     dayMetricsByRange[r] = computeDayMetrics(today, r, activity, deals, owners);
   }
   const dayMetrics = dayMetricsByRange['today'];
-  const channels = computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, owners);
+  const channels = computeChannelROI(deals, dealContactIdMap, contactAnalyticsSources, contactChannels, owners);
   const pnl = computePnL(mrr, churn);
   const instantlyMetrics = computeInstantlyMetrics(instantly);
 
@@ -1117,19 +1143,22 @@ function generateHTML(data, { view = 'rep', rep = '', date = '', range = 'today'
     </div>
   </div>
 
-  <!-- Channel Performance -->
+  <!-- Channel Performance (7-channel attribution) -->
   <h2 class="text-lg font-semibold text-gray-900 mb-3">Channel Performance</h2>
-  <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-    ${['cold_call', 'cold_email', 'inbound'].map(ch => {
+  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+    ${['cold_call', 'cold_email', 'linkedin_automation', 'paid_ads', 'organic_inbound', 'user_generated', 'referral', 'unknown'].map(ch => {
       const c = (data.channels || {})[ch] || {};
+      const hasCost = (c.cost || 0) > 0;
+      const dealsOrZero = c.deals || 0;
       return `<div class="card p-5">
         <h3 class="font-semibold text-gray-900 mb-3">${c.label || ch}</h3>
         <div class="space-y-2 text-sm">
-          <div class="flex justify-between"><span class="text-gray-500">Deals</span><span class="font-medium">${c.deals || 0}</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Deals</span><span class="font-medium">${dealsOrZero}</span></div>
           <div class="flex justify-between"><span class="text-gray-500">Won</span><span class="font-medium text-green-600">${c.won || 0}</span></div>
           <div class="flex justify-between"><span class="text-gray-500">Revenue</span><span class="font-medium">$${(c.revenue || 0).toLocaleString()}</span></div>
           <div class="flex justify-between"><span class="text-gray-500">Win Rate</span><span class="font-medium">${c.winRate || 0}%</span></div>
-          ${ch !== 'inbound' ? `<div class="flex justify-between"><span class="text-gray-500">ROI</span><span class="font-medium ${parseInt(c.roi) > 0 ? 'text-green-600' : 'text-red-600'}">${c.roi || 'N/A'}%</span></div>` : ''}
+          ${hasCost ? `<div class="flex justify-between"><span class="text-gray-500">Cost/mo</span><span class="font-medium">$${(c.cost || 0).toLocaleString()}</span></div>` : ''}
+          ${hasCost ? `<div class="flex justify-between"><span class="text-gray-500">ROI</span><span class="font-medium ${parseInt(c.roi) > 0 ? 'text-green-600' : 'text-red-600'}">${c.roi || 'N/A'}%</span></div>` : ''}
         </div>
       </div>`;
     }).join('')}
@@ -1469,6 +1498,90 @@ app.delete('/api/tasks/:id', (req, res) => {
   tasks.splice(idx, 1);
   saveTasksForDate(dateStr, tasks);
   res.json({ ok: true });
+});
+
+// ══════════════════════════════════════════
+// SOURCE ATTRIBUTION WEBHOOK
+// ══════════════════════════════════════════
+//
+// Accepts POST /webhook/source from cold-email/LinkedIn/form tools.
+// Writes original_source_channel (only when blank), latest_source_channel (always),
+// and first_utm (only when blank) on the HubSpot contact identified by email.
+//
+// Auth: X-Webhook-Secret header must match WEBHOOK_SECRET env var.
+//
+// Payload (JSON):
+//   { email: "x@y.com", channel: "cold_email" }          // explicit channel
+//   { email: "x@y.com", utm: { source, medium, campaign } } // derives channel from UTM
+//
+// Valid channels: cold_call, cold_email, linkedin_automation, paid_ads,
+//                 organic_inbound, user_generated, referral
+
+const VALID_CHANNELS = new Set([
+  'cold_call', 'cold_email', 'linkedin_automation', 'paid_ads',
+  'organic_inbound', 'user_generated', 'referral',
+]);
+
+function deriveChannelFromUTM(utm) {
+  if (!utm || typeof utm !== 'object') return null;
+  const source = (utm.source || '').toLowerCase();
+  const medium = (utm.medium || '').toLowerCase();
+  // Paid: any CPC/CPM medium or known paid source
+  if (medium === 'cpc' || medium === 'cpm' || medium === 'paid' || medium === 'ppc') return 'paid_ads';
+  if (['facebook', 'meta', 'instagram', 'google', 'linkedin_ads', 'tiktok'].includes(source) && medium === 'social') return 'paid_ads';
+  if (source === 'google' && (medium === 'organic' || !medium)) return 'organic_inbound';
+  if (medium === 'organic') return 'organic_inbound';
+  if (medium === 'referral') return 'referral';
+  if (medium === 'email' || source === 'instantly' || source === 'mailchimp') return 'cold_email';
+  if (source === 'linkedin' && medium !== 'social') return 'linkedin_automation';
+  // If any UTMs present but unrecognized — treat as paid_ads (utms usually mean campaigns)
+  return null;
+}
+
+async function findContactByEmail(email) {
+  const { data } = await api.post('/crm/v3/objects/contacts/search', {
+    filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }],
+    properties: ['email', 'original_source_channel', 'latest_source_channel', 'first_utm'],
+    limit: 1,
+  });
+  return data.results?.[0] || null;
+}
+
+app.post('/webhook/source', async (req, res) => {
+  const secret = process.env.WEBHOOK_SECRET;
+  if (!secret) return res.status(500).json({ error: 'webhook not configured (WEBHOOK_SECRET missing)' });
+  if ((req.headers['x-webhook-secret'] || '') !== secret) return res.status(401).json({ error: 'unauthorized' });
+
+  const { email, channel, utm } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'email required' });
+
+  // Resolve channel: explicit value > UTM-derived
+  let resolved = channel || deriveChannelFromUTM(utm);
+  if (!resolved || !VALID_CHANNELS.has(resolved)) {
+    return res.status(400).json({ error: `invalid channel "${resolved}" (must be one of: ${[...VALID_CHANNELS].join(', ')})` });
+  }
+
+  const utmStr = utm ? [utm.source, utm.medium, utm.campaign].filter(Boolean).join('|') : null;
+
+  try {
+    const existing = await findContactByEmail(email.toLowerCase());
+    const props = { latest_source_channel: resolved };
+    if (existing) {
+      if (!existing.properties.original_source_channel) props.original_source_channel = resolved;
+      if (utmStr && !existing.properties.first_utm) props.first_utm = utmStr;
+      await api.patch(`/crm/v3/objects/contacts/${existing.id}`, { properties: props });
+      return res.json({ ok: true, contactId: existing.id, action: 'updated', wrote: props });
+    } else {
+      props.original_source_channel = resolved;
+      if (utmStr) props.first_utm = utmStr;
+      const { data } = await api.post('/crm/v3/objects/contacts', { properties: { email: email.toLowerCase(), ...props } });
+      return res.json({ ok: true, contactId: data.id, action: 'created', wrote: props });
+    }
+  } catch (err) {
+    const detail = err.response?.data?.message || err.message;
+    console.error('[webhook/source] failed for', email, '—', detail);
+    return res.status(500).json({ error: 'hubspot write failed', detail });
+  }
 });
 
 app.get('/refresh', async (req, res) => {
