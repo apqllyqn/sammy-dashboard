@@ -1577,7 +1577,7 @@ function deriveChannelFromUTM(utm) {
 async function findContactByEmail(email) {
   const { data } = await api.post('/crm/v3/objects/contacts/search', {
     filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }],
-    properties: ['email', 'original_source_channel', 'latest_source_channel', 'first_utm'],
+    properties: ['email', 'original_source_channel', 'latest_source_channel', 'first_utm', 'hs_object_source_label'],
     limit: 1,
   });
   return data.results?.[0] || null;
@@ -1681,17 +1681,46 @@ app.post('/webhook/instantly', async (req, res) => {
 });
 
 // Aircall: call.created or call.ended event → cold_call
+// PROVENANCE GATE (Chris's rule): cold_call is a valid ORIGINAL source only when the
+// contact was CSV-uploaded (a genuine cold list) and then dialed, OR when the dial
+// creates a brand-new contact (dialing a fresh cold number). A contact that already
+// arrived some other way (app signup, Clay, form) and is now being dialed is a WARM
+// call: record it on latest_source_channel only, never on original.
 app.post('/webhook/aircall', async (req, res) => {
   if ((req.query.secret || '') !== (process.env.WEBHOOK_SECRET || '___unset___')) {
     return res.status(401).json({ error: 'unauthorized' });
   }
   // Aircall sends nested contact info; try both contact.email and data.contact.email
   const body = req.body || {};
-  const email = body.data?.contact?.email || body.contact?.email || extractEmailFromAny(body);
+  const email = (body.data?.contact?.email || body.contact?.email || extractEmailFromAny(body) || '').toLowerCase();
   if (!email) return res.status(400).json({ error: 'could not extract email from payload' });
+  // DIRECTION GATE: an INBOUND call is the prospect/customer calling US (support,
+  // callbacks, spam) - it is never a cold-call acquisition. Only OUTBOUND dials count.
+  const direction = String(body.data?.direction || body.direction || '').toLowerCase();
   try {
-    const result = await writeChannel(email, 'cold_call', null);
-    res.json({ ok: true, ...result });
+    if (direction === 'inbound') {
+      const existing = await findContactByEmail(email);
+      if (existing) return res.json({ ok: true, contactId: existing.id, action: 'inbound-noop' });
+      // Unknown inbound caller with an email = inbound interest.
+      const { data } = await api.post('/crm/v3/objects/contacts', { properties: { email, original_source_channel: 'organic_inbound', latest_source_channel: 'organic_inbound' } });
+      return res.json({ ok: true, contactId: data.id, action: 'created-inbound', wrote: { original_source_channel: 'organic_inbound' } });
+    }
+    const existing = await findContactByEmail(email);
+    const props = { latest_source_channel: 'cold_call' };
+    if (existing) {
+      const isColdOrigin = existing.properties.hs_object_source_label === 'IMPORT';
+      // Only claim cold_call as ORIGINAL for CSV-origin contacts with no channel yet.
+      if (isColdOrigin && !existing.properties.original_source_channel) {
+        props.original_source_channel = 'cold_call';
+      }
+      await api.patch(`/crm/v3/objects/contacts/${existing.id}`, { properties: props });
+      return res.json({ ok: true, contactId: existing.id, action: 'updated', warmCall: !props.original_source_channel, wrote: props });
+    } else {
+      // No existing contact = dialing a fresh number = genuine cold call.
+      props.original_source_channel = 'cold_call';
+      const { data } = await api.post('/crm/v3/objects/contacts', { properties: { email, ...props } });
+      return res.json({ ok: true, contactId: data.id, action: 'created', wrote: props });
+    }
   } catch (err) {
     console.error('[webhook/aircall]', email, err.response?.data?.message || err.message);
     res.status(500).json({ error: 'hubspot write failed' });
