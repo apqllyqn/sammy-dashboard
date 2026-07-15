@@ -1639,7 +1639,14 @@ function extractEmailFromAny(body) {
   return null;
 }
 
-async function writeChannel(email, channel, utm) {
+function extractNameFromAny(body) {
+  if (!body || typeof body !== 'object') return {};
+  const first = body.firstName || body.first_name || body.lead_first_name || body.lead?.first_name || body.contact?.first_name || null;
+  const last = body.lastName || body.last_name || body.lead_last_name || body.lead?.last_name || body.contact?.last_name || null;
+  return { first, last };
+}
+
+async function writeChannel(email, channel, utm, names) {
   const utmStr = utm ? [utm.source, utm.medium, utm.campaign].filter(Boolean).join('|') : null;
   const existing = await findContactByEmail(email);
   const props = { latest_source_channel: channel };
@@ -1654,11 +1661,15 @@ async function writeChannel(email, channel, utm) {
   if (existing) {
     if (!existing.properties.original_source_channel) props.original_source_channel = channel;
     if (utmStr && !existing.properties.first_utm) props.first_utm = utmStr;
+    if (names?.first && !existing.properties.firstname) props.firstname = names.first;
+    if (names?.last && !existing.properties.lastname) props.lastname = names.last;
     await api.patch(`/crm/v3/objects/contacts/${existing.id}`, { properties: props });
     return { contactId: existing.id, action: 'updated', wrote: props };
   } else {
     props.original_source_channel = channel;
     if (utmStr) props.first_utm = utmStr;
+    if (names?.first) props.firstname = names.first;
+    if (names?.last) props.lastname = names.last;
     const { data } = await api.post('/crm/v3/objects/contacts', { properties: { email, ...props } });
     return { contactId: data.id, action: 'created', wrote: props };
   }
@@ -1669,10 +1680,17 @@ app.post('/webhook/instantly', async (req, res) => {
   if ((req.query.secret || '') !== (process.env.WEBHOOK_SECRET || '___unset___')) {
     return res.status(401).json({ error: 'unauthorized' });
   }
+  // POSITIVE-INTENT GATE: only interested leads become cold_email contacts.
+  // Bounces, OOO, unsubscribes and negative replies must never create records
+  // (this is the leak that filled HubSpot with nameless junk, May-Jul 2026).
+  const evt = String(req.body?.event_type || req.body?.event || '').toLowerCase();
+  if (evt && !evt.includes('interested')) {
+    return res.json({ ok: true, action: 'ignored-non-positive-event', event: evt });
+  }
   const email = extractEmailFromAny(req.body);
   if (!email) return res.status(400).json({ error: 'could not extract email from payload', payload: req.body });
   try {
-    const result = await writeChannel(email, 'cold_email', null);
+    const result = await writeChannel(email, 'cold_email', null, extractNameFromAny(req.body));
     res.json({ ok: true, ...result });
   } catch (err) {
     console.error('[webhook/instantly]', email, err.response?.data?.message || err.message);
