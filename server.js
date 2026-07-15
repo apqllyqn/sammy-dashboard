@@ -1691,8 +1691,12 @@ app.post('/webhook/instantly', async (req, res) => {
   }
   const email = extractEmailFromAny(req.body);
   if (!email) return res.status(400).json({ error: 'could not extract email from payload', payload: req.body });
+  // Campaign-level attribution: stamp the Instantly campaign as the utm campaign
+  // (write-once via writeChannel) so cold-email conversions are reportable per campaign.
+  const campaignName = req.body?.campaign_name || req.body?.campaignName || req.body?.campaign?.name || null;
+  const utm = campaignName ? { source: 'instantly', medium: 'email', campaign: campaignName } : null;
   try {
-    const result = await writeChannel(email, 'cold_email', null, extractNameFromAny(req.body));
+    const result = await writeChannel(email, 'cold_email', utm, extractNameFromAny(req.body));
     res.json({ ok: true, ...result });
   } catch (err) {
     console.error('[webhook/instantly]', email, err.response?.data?.message || err.message);
