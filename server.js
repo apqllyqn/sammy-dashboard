@@ -13,7 +13,9 @@ const api = axios.create({
 });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const app = express();
-app.use(express.json());
+// 5mb limit: Instantly reply webhooks include full thread history and were
+// 413-rejected at the default 100kb, silently dropping interested-lead events.
+app.use(express.json({ limit: '5mb' }));
 const PORT = process.env.PORT || 3000;
 
 // ══════════════════════════════════════════
