@@ -1691,6 +1691,12 @@ app.post('/webhook/instantly', async (req, res) => {
   }
   const email = extractEmailFromAny(req.body);
   if (!email) return res.status(400).json({ error: 'could not extract email from payload', payload: req.body });
+  // SYSTEM-INBOX GATE: replies from support/no-reply addresses are vendor auto-responses
+  // that Instantly's AI sometimes mislabels "interested". They are never cold-email leads.
+  const localPart = email.split('@')[0];
+  if (['support', 'noreply', 'no-reply', 'donotreply', 'notifications', 'postmaster', 'mailer-daemon', 'help'].includes(localPart)) {
+    return res.json({ ok: true, action: 'ignored-system-inbox', email });
+  }
   // Campaign-level attribution: stamp the Instantly campaign as the utm campaign
   // (write-once via writeChannel) so cold-email conversions are reportable per campaign.
   const campaignName = req.body?.campaign_name || req.body?.campaignName || req.body?.campaign?.name || null;
