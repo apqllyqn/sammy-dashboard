@@ -13,7 +13,9 @@ const api = axios.create({
 });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const app = express();
-app.use(express.json());
+// 5mb limit: Instantly reply webhooks include full thread history and were
+// 413-rejected at the default 100kb, silently dropping interested-lead events.
+app.use(express.json({ limit: '5mb' }));
 const PORT = process.env.PORT || 3000;
 
 // ══════════════════════════════════════════
@@ -1577,7 +1579,7 @@ function deriveChannelFromUTM(utm) {
 async function findContactByEmail(email) {
   const { data } = await api.post('/crm/v3/objects/contacts/search', {
     filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }],
-    properties: ['email', 'original_source_channel', 'latest_source_channel', 'first_utm'],
+    properties: ['email', 'original_source_channel', 'latest_source_channel', 'first_utm', 'hs_object_source_label'],
     limit: 1,
   });
   return data.results?.[0] || null;
@@ -1639,7 +1641,14 @@ function extractEmailFromAny(body) {
   return null;
 }
 
-async function writeChannel(email, channel, utm) {
+function extractNameFromAny(body) {
+  if (!body || typeof body !== 'object') return {};
+  const first = body.firstName || body.first_name || body.lead_first_name || body.lead?.first_name || body.contact?.first_name || null;
+  const last = body.lastName || body.last_name || body.lead_last_name || body.lead?.last_name || body.contact?.last_name || null;
+  return { first, last };
+}
+
+async function writeChannel(email, channel, utm, names) {
   const utmStr = utm ? [utm.source, utm.medium, utm.campaign].filter(Boolean).join('|') : null;
   const existing = await findContactByEmail(email);
   const props = { latest_source_channel: channel };
@@ -1654,11 +1663,15 @@ async function writeChannel(email, channel, utm) {
   if (existing) {
     if (!existing.properties.original_source_channel) props.original_source_channel = channel;
     if (utmStr && !existing.properties.first_utm) props.first_utm = utmStr;
+    if (names?.first && !existing.properties.firstname) props.firstname = names.first;
+    if (names?.last && !existing.properties.lastname) props.lastname = names.last;
     await api.patch(`/crm/v3/objects/contacts/${existing.id}`, { properties: props });
     return { contactId: existing.id, action: 'updated', wrote: props };
   } else {
     props.original_source_channel = channel;
     if (utmStr) props.first_utm = utmStr;
+    if (names?.first) props.firstname = names.first;
+    if (names?.last) props.lastname = names.last;
     const { data } = await api.post('/crm/v3/objects/contacts', { properties: { email, ...props } });
     return { contactId: data.id, action: 'created', wrote: props };
   }
@@ -1669,10 +1682,27 @@ app.post('/webhook/instantly', async (req, res) => {
   if ((req.query.secret || '') !== (process.env.WEBHOOK_SECRET || '___unset___')) {
     return res.status(401).json({ error: 'unauthorized' });
   }
+  // POSITIVE-INTENT GATE: only interested leads become cold_email contacts.
+  // Bounces, OOO, unsubscribes and negative replies must never create records
+  // (this is the leak that filled HubSpot with nameless junk, May-Jul 2026).
+  const evt = String(req.body?.event_type || req.body?.event || '').toLowerCase();
+  if (evt && !evt.includes('interested')) {
+    return res.json({ ok: true, action: 'ignored-non-positive-event', event: evt });
+  }
   const email = extractEmailFromAny(req.body);
   if (!email) return res.status(400).json({ error: 'could not extract email from payload', payload: req.body });
+  // SYSTEM-INBOX GATE: replies from support/no-reply addresses are vendor auto-responses
+  // that Instantly's AI sometimes mislabels "interested". They are never cold-email leads.
+  const localPart = email.split('@')[0];
+  if (['support', 'noreply', 'no-reply', 'donotreply', 'notifications', 'postmaster', 'mailer-daemon', 'help'].includes(localPart)) {
+    return res.json({ ok: true, action: 'ignored-system-inbox', email });
+  }
+  // Campaign-level attribution: stamp the Instantly campaign as the utm campaign
+  // (write-once via writeChannel) so cold-email conversions are reportable per campaign.
+  const campaignName = req.body?.campaign_name || req.body?.campaignName || req.body?.campaign?.name || null;
+  const utm = campaignName ? { source: 'instantly', medium: 'email', campaign: campaignName } : null;
   try {
-    const result = await writeChannel(email, 'cold_email', null);
+    const result = await writeChannel(email, 'cold_email', utm, extractNameFromAny(req.body));
     res.json({ ok: true, ...result });
   } catch (err) {
     console.error('[webhook/instantly]', email, err.response?.data?.message || err.message);
@@ -1681,17 +1711,46 @@ app.post('/webhook/instantly', async (req, res) => {
 });
 
 // Aircall: call.created or call.ended event → cold_call
+// PROVENANCE GATE (Chris's rule): cold_call is a valid ORIGINAL source only when the
+// contact was CSV-uploaded (a genuine cold list) and then dialed, OR when the dial
+// creates a brand-new contact (dialing a fresh cold number). A contact that already
+// arrived some other way (app signup, Clay, form) and is now being dialed is a WARM
+// call: record it on latest_source_channel only, never on original.
 app.post('/webhook/aircall', async (req, res) => {
   if ((req.query.secret || '') !== (process.env.WEBHOOK_SECRET || '___unset___')) {
     return res.status(401).json({ error: 'unauthorized' });
   }
   // Aircall sends nested contact info; try both contact.email and data.contact.email
   const body = req.body || {};
-  const email = body.data?.contact?.email || body.contact?.email || extractEmailFromAny(body);
+  const email = (body.data?.contact?.email || body.contact?.email || extractEmailFromAny(body) || '').toLowerCase();
   if (!email) return res.status(400).json({ error: 'could not extract email from payload' });
+  // DIRECTION GATE: an INBOUND call is the prospect/customer calling US (support,
+  // callbacks, spam) - it is never a cold-call acquisition. Only OUTBOUND dials count.
+  const direction = String(body.data?.direction || body.direction || '').toLowerCase();
   try {
-    const result = await writeChannel(email, 'cold_call', null);
-    res.json({ ok: true, ...result });
+    if (direction === 'inbound') {
+      const existing = await findContactByEmail(email);
+      if (existing) return res.json({ ok: true, contactId: existing.id, action: 'inbound-noop' });
+      // Unknown inbound caller with an email = inbound interest.
+      const { data } = await api.post('/crm/v3/objects/contacts', { properties: { email, original_source_channel: 'organic_inbound', latest_source_channel: 'organic_inbound' } });
+      return res.json({ ok: true, contactId: data.id, action: 'created-inbound', wrote: { original_source_channel: 'organic_inbound' } });
+    }
+    const existing = await findContactByEmail(email);
+    const props = { latest_source_channel: 'cold_call' };
+    if (existing) {
+      const isColdOrigin = existing.properties.hs_object_source_label === 'IMPORT';
+      // Only claim cold_call as ORIGINAL for CSV-origin contacts with no channel yet.
+      if (isColdOrigin && !existing.properties.original_source_channel) {
+        props.original_source_channel = 'cold_call';
+      }
+      await api.patch(`/crm/v3/objects/contacts/${existing.id}`, { properties: props });
+      return res.json({ ok: true, contactId: existing.id, action: 'updated', warmCall: !props.original_source_channel, wrote: props });
+    } else {
+      // No existing contact = dialing a fresh number = genuine cold call.
+      props.original_source_channel = 'cold_call';
+      const { data } = await api.post('/crm/v3/objects/contacts', { properties: { email, ...props } });
+      return res.json({ ok: true, contactId: data.id, action: 'created', wrote: props });
+    }
   } catch (err) {
     console.error('[webhook/aircall]', email, err.response?.data?.message || err.message);
     res.status(500).json({ error: 'hubspot write failed' });
